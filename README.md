@@ -124,24 +124,92 @@ used in `hcode`'s harness boundary.
 the milestone sequence and `docs/VERIFIED-ENVIRONMENT.md` for exactly what has been checked on a
 real host.
 
-## Requirements
-
-- Linux with KVM (`/dev/kvm` reachable by your user — `sudo usermod -aG kvm $USER`)
-- QEMU (`qemu-system-x86_64`) with `vhost-vsock-pci` only if you enable the vsock transport
-- Rust (stable) + `rustup target add x86_64-pc-windows-gnu` + `x86_64-w64-mingw32-gcc`
-- A Windows 11 image (tiny11 or equivalent recommended)
-
-## Build
+## Quickstart
 
 ```sh
-# host daemon
+# 1. Check the host. This performs the checks, rather than reading metadata about them.
 cargo build --release -p wvm-host
+./target/release/wvm doctor
 
-# guest service — cross-compiled from Linux, no Windows toolchain required
+# 2. Build the guest service — cross-compiled from Linux, no Windows toolchain needed.
 rustup target add x86_64-pc-windows-gnu
 cargo build --release --target x86_64-pc-windows-gnu -p wvm-guest
+
+# 3. Locate your ISOs, write the configs, and create the disk.
+#    Reports an in-flight browser download as such rather than "not found".
+./scripts/prepare-install.sh
+
+# 4. Read the command line before running it.
+./target/release/wvm vm cmdline --config ~/wvm/install.toml
+
+# 5. Install Windows.
+./target/release/wvm vm start --config ~/wvm/install.toml --timeout 300
+./target/release/wvm vm log   --config ~/wvm/install.toml --lines 60
 ```
+
+Two ISOs are needed and both matter:
+
+| ISO | Why |
+|---|---|
+| a Windows image | tiny11 recommended — it needs neither TPM 2.0 nor Secure Boot |
+| **virtio-win drivers** | Windows has no in-box virtio driver. **Without this, Setup reports no disks.** |
+
+In Windows Setup, when it asks where to install: **Load driver** → browse the driver CD →
+`viostor` → `w11` → `amd64` → *Red Hat VirtIO SCSI controller*. The disk then appears.
+
+After installation, use the other config so the installer is no longer attached:
+
+```sh
+./target/release/wvm vm shutdown --config ~/wvm/install.toml
+./target/release/wvm vm start    --config ~/wvm/wvm.toml
+```
+
+Two configs, not one, because a bootable installer left attached to a working VM drops it back into
+Windows Setup.
+
+## Running without a VM
+
+The control plane, the policy gate and the journal are all exercisable with no guest:
+
+```sh
+./target/release/wvm serve --socket /tmp/wvm.sock &
+./target/release/wvm call --socket /tmp/wvm.sock hello
+./target/release/wvm call --socket /tmp/wvm.sock inspect
+
+# Narrow the grant and watch the boundary hold.
+./target/release/wvm serve --socket /tmp/wvm-ro.sock --verbs inspect
+
+./target/release/wvm journal --limit 20
+```
+
+Denials are journalled alongside successes, with the reason:
+
+```
+{"event":{"kind":"request","verb":"lifecycle","op":"lifecycle"}}
+{"event":{"kind":"denied","verb":"lifecycle","reason":"VerbNotGranted"}}
+```
+
+## Status
+
+**Pre-alpha.** Working and verified: the protocol, the capability boundary, the journal, the
+control socket, and QEMU supervision (a VM genuinely boots — the serial console shows OVMF reaching
+the UEFI boot manager). The guest service's path and transfer logic is written and tested; its
+Win32 layer is not yet implemented, and every operation that needs it returns an explicit
+`not implemented` rather than a plausible-looking success.
+
+See `docs/BUILD-PLAN.md` for the milestone detail and `docs/DECISIONS.md` for the reasoning.
+
+## Requirements
+
+- Linux with KVM (`/dev/kvm` openable by your user — group membership or an ACL)
+- QEMU (`qemu-system-x86_64`, `qemu-img`) with OVMF for UEFI
+- Rust (stable) + `rustup target add x86_64-pc-windows-gnu` + `x86_64-w64-mingw32-gcc`
+- A Windows image (tiny11 recommended) and the virtio-win driver ISO
+
+`wvm doctor` checks all of these, and tests by performing each operation rather than inspecting it —
+a metadata check reports false failures against ACLs. See `docs/DECISIONS.md` D-005.
 
 ## License
 
 MIT — to be confirmed before first public push.
+

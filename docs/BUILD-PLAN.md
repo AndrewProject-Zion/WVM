@@ -162,15 +162,24 @@ one. See `docs/VM-CONFIG.md`.
 
 ## M4 — Guest service
 
-- [ ] `wvm-guest` cross-compiled from Linux, installed as a Windows service
-- [ ] Implement the transport trait; length-prefixed framing matching the host
+- [x] `wvm-guest` cross-compiled from Linux (437 KB PE32+, core DLLs only)
+- [x] Length-prefixed framing matching the host, transport behind a trait
+- [x] Windows path canonicalisation with containment rules
+- [x] Transfer planning and execution, with overwrite refusal
+- [ ] Install as a Windows service inside a running guest
 - [ ] Process launch with stdout/stderr capture and exit code
 - [ ] Input injection and framebuffer capture
-- [ ] File transfer restricted to declared roots
+- [ ] Wire the transport, paths and transfer modules into `dispatch`
 
-**Verification:** from the host, launch a process in the guest and read its real output; capture a
-screenshot and confirm it is a valid PNG with a plausible size; refuse a transfer outside the
-declared root.
+**Verified so far:** the guest binary cross-compiles and imports only `KERNEL32`, `msvcrt`,
+`ntdll`, `WS2_32` and `api-ms-win-core-synch-l1-2-0` — no VC++ redistributable to install inside a
+debloated guest. Path and transfer logic is covered by 36 tests that run on the host.
+
+**Why the platform layer is still stubbed.** `dispatch` returns an explicit
+`{op}: not implemented in this build` for anything needing the guest, and a test asserts that a
+stub never reports success. The transport, path and transfer modules are real and tested; what
+remains is the Win32 layer, which needs a running VM to develop against.
+
 
 ## M5 — Agent surface
 
