@@ -8,7 +8,7 @@
 //! The format is JSON Lines: one self-contained object per line, so a truncated final line is
 //! recoverable and the file can be tailed with standard tools.
 
-#![allow(dead_code)] // `append` is wired in when the request path lands (M2).
+#![allow(dead_code)] // `append` is wired into the request path (M2); `path` for diagnostics.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
