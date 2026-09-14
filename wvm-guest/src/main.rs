@@ -14,6 +14,7 @@
 //! worse than a stub that says it does not.
 
 mod dispatch;
+mod paths;
 mod transport;
 
 use anyhow::Result;
