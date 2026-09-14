@@ -199,6 +199,27 @@ Win32 layer is not yet implemented, and every operation that needs it returns an
 
 See `docs/BUILD-PLAN.md` for the milestone detail and `docs/DECISIONS.md` for the reasoning.
 
+## docs/
+
+| File | Content |
+|---|---|
+| `BUILD-PLAN.md` | the milestone sequence, with a recorded verification for each |
+| `DECISIONS.md` | D-001..D-006 — what was decided, what was rejected, and why |
+| `VERIFIED-ENVIRONMENT.md` | every host check, with the command that produced it |
+| `VM-CONFIG.md` | the VM definition reference, including the two-ISO requirement |
+| `ORIGINAL-NOTES.txt` | the notes that started the project, preserved as received |
+
+## scripts/
+
+| Script | Purpose |
+|---|---|
+| `prepare-install.sh` | locate the ISOs, write both configs, create the disk |
+| `install-guest-service.ps1` | install the guest service as a Windows service |
+
+`install-guest-service.ps1` registers the service but deliberately does not start it — a control
+service that begins listening before you have decided it should is a bigger step than an installer
+ought to take on your behalf. It prints the command to start it.
+
 ## Requirements
 
 - Linux with KVM (`/dev/kvm` openable by your user — group membership or an ACL)
