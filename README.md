@@ -189,6 +189,30 @@ Denials are journalled alongside successes, with the reason:
 {"event":{"kind":"denied","verb":"lifecycle","reason":"VerbNotGranted"}}
 ```
 
+### A reference client, and a demonstration of the gate
+
+`examples/wvm_client.py` is a dependency-free Python client — standard library only, no build step.
+It speaks the same protocol the Rust host does, which makes it both a usage example and a second
+independent implementation of the wire format.
+
+```sh
+# Start a daemon with only the Inspect verb, then try to exceed it.
+python3 examples/wvm_client.py boundary
+```
+
+```
+  hello      -> handshake accepted; peer reports: no guest channel yet
+  inspect    -> inventory: os='host (no guest channel yet)', 0 drive(s), 0 app(s)
+  capture    -> REFUSED
+  lifecycle  -> REFUSED
+  exec       -> REFUSED
+
+Every ungranted verb was refused. The grant held.
+```
+
+That output is from a real run against the real daemon. It exits non-zero if anything the grant
+forbids is permitted, so it works as a check rather than only as a demo.
+
 ## Status
 
 **Pre-alpha.** Working and verified: the protocol, the capability boundary, the journal, the
