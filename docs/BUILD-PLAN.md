@@ -39,18 +39,52 @@ guest, which is the point of cross-compiling with the GNU toolchain.
 aligned, clean-EOF-vs-truncation, an oversized header refused *before* allocation, and a
 `deny_all` grant refusing every verb.
 
-## M2 — Host daemon, no VM
+## M2 — Host daemon, no VM  ← COMPLETE
 
-- [x] `wvm-host` CLI: `doctor`, `journal`
+- [x] `wvm-host` CLI: `doctor`, `serve`, `call`, `journal`
 - [x] `doctor` reproduces the checks in `VERIFIED-ENVIRONMENT.md`
-- [ ] Unix socket server speaking `wvm-ipc`
+- [x] Unix socket server speaking `wvm-ipc`
 - [x] Journal: append-only
-- [ ] Wire the journal into the request path
-- [ ] Capability denial path exercised end to end
+- [x] Journal wired into the request path — requests, completions **and denials**
+- [x] Capability denial path exercised end to end
 
-**Verification so far:** `wvm doctor` passes on this host and correctly reports KVM access as
-arriving via an ACL rather than group membership (see D-005 — the metadata-based first draft
-reported a false failure).
+**Verification (live, 2026-09-14):**
+
+```
+cargo test --workspace              57 passed, 0 failed
+cargo clippy --workspace --all-targets    0 warnings
+
+./target/release/wvm serve --socket /tmp/wvm.sock &
+./target/release/wvm call --socket /tmp/wvm.sock hello
+  -> protocol 1; peer: no guest channel yet (M3 not started)
+./target/release/wvm call --socket /tmp/wvm.sock inspect
+  -> os: "host (no guest channel yet)", drives: [], apps: []
+stat -c '%a' /tmp/wvm.sock        -> 600
+```
+
+The boundary was exercised against a daemon started with `--verbs inspect`:
+
+```
+lifecycle  -> denied (VerbNotGranted): lifecycle is not permitted for local-dev
+capture    -> denied (VerbNotGranted): capture is not permitted for local-dev
+```
+
+Both refusals appear in the journal with their reason, alongside the request that triggered them:
+
+```
+{"event":{"kind":"request","verb":"lifecycle","op":"lifecycle"}}
+{"event":{"kind":"denied","verb":"lifecycle","reason":"VerbNotGranted"}}
+```
+
+Also verified live: rebinding over a socket file left behind by a `kill -9` (where `Drop` cannot
+run) succeeds. The stale file proves nothing about whether anything is listening.
+
+**Bug found by reading live output rather than by a test.** The first version classified any
+response that was not `Ok` as a failure, so every `Ready` handshake was journalled as `ok:false`.
+An audit log that reports false errors on the happy path trains its readers to ignore it.
+Handshakes are now not journalled at all — one per connection would bury the events that matter —
+and `a_handshake_is_not_journalled_as_a_failure` is the regression test that would have caught it.
+
 
 
 ## M3 — QEMU supervision
