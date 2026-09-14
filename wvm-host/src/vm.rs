@@ -164,6 +164,94 @@ impl VmConfig {
         })
     }
 
+    /// Has this disk already been written to, and if so, which firmware did it?
+    ///
+    /// A BIOS-installed Windows has no EFI System Partition, so booting it under UEFI firmware
+    /// finds no bootloader and drops to the firmware's boot menu — with no error message, because
+    /// from the firmware's point of view an unbootable disk is a normal, expected condition.
+    ///
+    /// That mismatch is easy to create and hard to read: it happens whenever `firmware` is changed
+    /// in one config but not another, which is exactly what happened during the first install here
+    /// (`install.toml` was switched to `bios` for the BIOS-only tiny11 ISO; `wvm.toml` was left on
+    /// `uefi`, and the installed system then appeared not to boot).
+    ///
+    /// This inspects the image for the two boot structures and reports what it finds, so the
+    /// mismatch can be named rather than guessed at. Returns `None` for an empty or unreadable
+    /// image — an uninstalled disk has no opinion.
+    pub fn detect_installed_firmware(&self) -> Option<Firmware> {
+        // Read raw sectors out of the qcow2 with `qemu-img dd`. Note the argument form: `dd` takes
+        // `if=`/`of=` and `-f` for the input format, NOT the `--image-opts` string that other
+        // qemu-img subcommands accept. Passing the option string here produces
+        //   "qemu-img: unrecognized operand file.filename"
+        // and — because the earlier version ignored the exit status — an empty stdout, which then
+        // looked exactly like "no boot structures found" and made the whole check a silent no-op.
+        // `qemu-img dd` refuses `of=/dev/stdout` — it tries to seek/resize the output and fails
+        // with "Could not resize file: Invalid argument". So the read goes to a real temporary
+        // file, which is then read back. Slightly more work; it is the form that actually works.
+        let read = |count: u32| -> Option<Vec<u8>> {
+            let tmp = std::env::temp_dir().join(format!(
+                "wvm-parttable-{}-{}.bin",
+                std::process::id(),
+                count
+            ));
+            let _ = std::fs::remove_file(&tmp);
+
+            let out = std::process::Command::new("qemu-img")
+                .arg("dd")
+                .arg(format!("if={}", self.disk.display()))
+                .arg(format!("of={}", tmp.display()))
+                .arg("bs=512")
+                .arg(format!("count={count}"))
+                .arg("-f")
+                .arg("qcow2")
+                .arg("-O")
+                .arg("raw")
+                .output()
+                .ok()?;
+
+            // A failed read is a real failure, not "nothing installed". Saying so is what makes
+            // this check trustworthy rather than decorative — an earlier version ignored the exit
+            // status, got empty output, and silently read that as "no boot structures found".
+            if !out.status.success() {
+                eprintln!(
+                    "wvm: warning: could not read the partition table from {} ({}); \
+                     skipping the firmware-mismatch check",
+                    self.disk.display(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                let _ = std::fs::remove_file(&tmp);
+                return None;
+            }
+
+            let bytes = std::fs::read(&tmp).ok();
+            let _ = std::fs::remove_file(&tmp);
+
+            match bytes {
+                Some(b) if b.len() >= (count as usize) * 512 => Some(b),
+                _ => None,
+            }
+        };
+
+        // MBR signature at 0x1FE. Absent means the disk is not partitioned — nothing installed.
+        let first = read(1)?;
+        if first.get(510) != Some(&0x55) || first.get(511) != Some(&0xAA) {
+            return None;
+        }
+
+        // A GPT disk whose partition table contains an EFI System Partition is a UEFI install.
+        // The ESP type GUID is C12A7328-F81F-11D2-BA4B-00A0C93EC93B, stored little-endian, so its
+        // first eight bytes on disk are 28 73 2a c1 1f f8 d2 11.
+        let table = read(34)?;
+        const ESP_GUID_LE: [u8; 8] = [0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11];
+        let has_esp = table.windows(ESP_GUID_LE.len()).any(|w| w == ESP_GUID_LE);
+
+        Some(if has_esp {
+            Firmware::Uefi
+        } else {
+            Firmware::Bios
+        })
+    }
+
     pub fn pid_file(&self) -> PathBuf {
         self.state_dir().join("qemu.pid")
     }

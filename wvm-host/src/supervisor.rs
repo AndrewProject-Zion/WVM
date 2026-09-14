@@ -200,6 +200,31 @@ impl Supervisor {
             if !status.success() {
                 bail!("qemu-img failed to create {}", self.config.disk.display());
             }
+        } else {
+            // The disk exists, which means something may already be installed on it. If the
+            // configured firmware does not match how it was installed, the guest will not boot and
+            // the firmware will say nothing — an unbootable disk is a normal condition to it.
+            //
+            // This is worth a hard error rather than a warning: the symptom (a boot menu, or a
+            // blank screen) gives no hint of the cause, and the fix is a one-line config change.
+            if let Some(installed) = self.config.detect_installed_firmware() {
+                if installed != self.config.firmware {
+                    bail!(
+                        "firmware mismatch: {} was installed under {:?} firmware but the config \
+                         says {:?}.\n\
+                         The guest will not boot, and the firmware will not report why.\n\
+                         Fix: set `firmware = \"{}\"` in the VM config, or reinstall under the other \
+                         firmware.",
+                        self.config.disk.display(),
+                        installed,
+                        self.config.firmware,
+                        match installed {
+                            crate::vm::Firmware::Uefi => "uefi",
+                            crate::vm::Firmware::Bios => "bios",
+                        }
+                    );
+                }
+            }
         }
 
         // A writable copy of the UEFI variable store is required per instance; without it,
