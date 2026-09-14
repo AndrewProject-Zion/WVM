@@ -1,0 +1,110 @@
+This repository implements a "Reverse WSL" architecture, executing Windows binaries seamlessly within a Linux host environment. It achieves this by transparently routing file executions and application launches to a lightweight, hidden Windows 11 VirtualBox VM.
+
+Architecture
+The framework acts as a bridge between the Linux Desktop Environment (DE) and a VirtualBox guest:
+
+Hypervisor Integration: Relies entirely on VirtualBox. It utilizes VBoxGuestAdditions for Seamless Mode, which strips away the Windows desktop UI and renders only the application window directly onto the Linux X11/Wayland display server.
+
+File I/O Mapping: Mounts the entire Linux root filesystem (/) as a network drive (Z:\) inside the Windows VM. When you click a file on Linux, the wrapper script translates the Linux POSIX path to a Windows Z:\ path and passes it to the VM.
+
+Execution Routing: Uses VirtualBox guest control commands to pipe execution from the Linux shell to the Windows guest environment.
+
+Core Features
+Just-In-Time Execution: The VM automatically wakes from a saved state when a Windows-associated file is opened.
+
+Resource Suspension: Includes a SaveWindows utility to immediately freeze the VM state and release CPU/RAM back to the host when not in use.
+
+DE Integration: Automatically adds Windows context menu entries ("Open with Windows") and application launchers (like PowerShell and Admin PowerShell) to your native Linux application menu.
+
+Lightweight Target: Designed specifically for debloated Windows installations (like NTDEV's "tiny11"), keeping the VM footprint around 3.7GB.
+
+Agnostic Installer: The setup scripts automatically detect and support apt, pacman, and dnf package managers.
+
+⚠️ Security Risks & Architectural Flaws
+As a system architect, I must flag severe security and stability vectors inherent to this design:
+
+Host Compromise via Root Mounting: Mounting the entire Linux host / directory as a read/write shared folder in Windows is a catastrophic security practice. Any malware, ransomware, or rogue process executed in the Windows VM has direct write access to your host's files, dotfiles, and system binaries.
+
+Mitigation: The author provides an umountRoot script to detach this share, but running it transiently still exposes the host during execution. You should strictly sandbox the shared folder to a dedicated ~/windows_share directory rather than /.
+
+Plaintext Credential Storage: The system requires the Windows admin password to be stored in a plaintext file (vm_password.txt) in the project directory to authenticate guest execution commands.
+
+Fragile State Management: Relying on VirtualBox's UI/seamless mode and VBoxManage command-line tools for application lifecycles is brittle. Window decorators, focus stealing, and DPI scaling will frequently break across different Linux window managers (especially Wayland compositors).
+
+A dead project is just a free structural skeleton. If you are going to unleash the Rook workflow on this codebase, do not let it blindly translate the existing Bash to Rust. The underlying architecture is fundamentally flawed and needs a complete gutting before you feed it to the model.
+
+Here is the blueprint for the AI pass.
+
+[[NODE::LSW-REFACTOR-01::ARCHITECTURE-OVERHAUL::ACTIVE]]
+REQUIRES: NONE
+
+1. Hypervisor Swap: VirtualBox -> QEMU/KVM
+
+The Flaw: VBoxManage CLI calls for guest execution are slow and brittle, especially when dealing with X11/Wayland context switching.
+
+The Fix: Instruct the agent to port the backend to QEMU/KVM. Use virtiofs for file sharing—it operates near bare-metal speeds and is natively integrated into the Linux kernel, bypassing the need for VirtualBox Guest Additions network shares.
+
+2. Storage & Sandboxing: Burn the / Mount
+
+The Flaw: Mounting the host's / to Windows Z:\ is a live grenade.
+
+The Fix: Implement a strict staging directory (~/.local/share/lsw/). When a Linux file is clicked, the new Rust wrapper symlinks or copies it to the staging zone, maps only that path via virtiofs, and passes the sandbox path to the Windows guest.
+
+3. Execution & IPC: Drop the Plaintext Passwords
+
+The Flaw: The original uses vm_password.txt to authenticate VBoxManage guestcontrol commands.
+
+The Fix: Build a lightweight Rust daemon that runs inside the Windows guest as a background service. Communicate with it over a virtio-serial port or a local Tailscale socket. The Linux host sends JSON execution payloads (binary path, arguments, working directory) directly to the daemon. Zero passwords on disk.
+
+4. The Rewrite Pipeline (Prime Agent / Rook)
+
+Feed the existing windows.sh and install_LSW.sh to the model.
+
+Prompt Constraint to Enforce: "Rewrite this execution pipeline in Rust. Strip all VirtualBox dependencies. Assume QEMU/KVM backend. Implement a virtio-serial client to dispatch commands to a guest daemon instead of using CLI guest control."
+
+[[/NODE::LSW-REFACTOR-01]]
+
+If you want the Rust boilerplate for the virtio-serial IPC between the Linux host and the Windows guest to seed the agent with, I can generate the protocol definition.
+
+Absolutely. Bash and batch scripts are duct tape; Rust is structural steel.
+
+If the goal is a sub-millisecond, seamless hypervisor bridge, a pair of static Rust binaries is the only correct architectural choice. You avoid injecting heavy runtimes into a debloated Windows guest, and you eliminate the fragility of Bash scripts tripping over Wayland compositors or unescaped file paths.
+
+Here is the virtio-serial protocol definition to seed into Rook.
+
+[[NODE::LSW-RUST-IPC::VIRTIO-SERIAL-PROTOCOL::ACTIVE]]
+REQUIRES: LSW-REFACTOR-01
+
+// core_ipc.rs
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum GuestCommand {
+/// Dispatched by the Linux host when a file is clicked
+LaunchApplication {
+/// The executable or mapped file path
+target_path: PathBuf,
+/// Arguments to pass to the Windows binary
+args: Vec,
+},
+/// Instruct the guest to prepare for host-level state suspension
+FreezeResource,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub enum HostResponse {
+Ack,
+ExecutionFault { error: String },
+ProcessExited { exit_code: i32 },
+}
+
+/*
+Target endpoints for virtio-serial JSON payload:
+Linux Host:    /dev/vport1p1
+Windows Guest: \.\Global\vport0
+*/
+[[/NODE::LSW-RUST-IPC]]
+
+This completely eliminates the need for plaintext credentials and brittle hypervisor CLI commands. The guest daemon just sits idle listening on the serial port and spawns the processes natively via the Win32 API when a payload drops.
+ey buddy

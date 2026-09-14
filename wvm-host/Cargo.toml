@@ -1,0 +1,20 @@
+[package]
+name = "wvm-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "WVM host daemon: capability boundary, policy, journal, and QEMU supervision"
+
+[[bin]]
+name = "wvm"
+path = "src/main.rs"
+
+[dependencies]
+wvm-ipc = { path = "../wvm-ipc" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+clap = { version = "4", features = ["derive"] }

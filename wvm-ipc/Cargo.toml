@@ -1,0 +1,13 @@
+[package]
+name = "wvm-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Wire protocol shared by the WVM host daemon and the Windows guest service"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

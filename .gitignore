@@ -1,0 +1,9 @@
+/target
+**/target
+*.qcow2
+*.img
+*.iso
+# Never commit guest credentials or install keys.
+*.key
+*.pem
+vm_password.txt
