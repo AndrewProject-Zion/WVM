@@ -63,6 +63,15 @@ pub struct VmConfig {
     /// derived from the instance name.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
+
+    /// Exit QEMU when the guest reboots, instead of rebooting it.
+    ///
+    /// Defaults to `false`, which is the correct setting for installation: Windows reboots
+    /// several times during setup, and exiting on the first of those makes the install appear to
+    /// vanish. Set `true` for a long-lived VM where a silent guest reboot should leave a visible
+    /// stopped VM rather than an empty process.
+    #[serde(default)]
+    pub no_reboot: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -217,7 +226,29 @@ impl VmConfig {
         a.push("-device".into());
         a.push("virtio-blk-pci,drive=disk0,bootindex=1".into());
 
-        // Installer ISO, if configured. Bootable.
+        // Optical drives.
+        //
+        // The bus choice here was arrived at by probing rather than assumption, after three wrong
+        // guesses. The constraint that finally settled it is not performance — it is a circular
+        // dependency:
+        //
+        //   Windows Setup has no virtio-scsi driver at install time. Putting the driver disc on
+        //   the virtio-scsi controller therefore makes it unreadable to the very Setup that needs
+        //   to read it. The disc must sit on a bus Windows understands natively.
+        //
+        // So both discs go on the q35 AHCI bus, which is emulated SATA: slow, but universally
+        // readable. The OS disk stays on virtio-blk, which Windows also cannot see until the
+        // driver loads — and that is fine, because loading that driver is precisely what the
+        // driver disc is for. The sequence is: Setup sees the AHCI discs, you point it at
+        // viostor on the driver disc, the virtio-blk disk appears, you install to it.
+        //
+        // Two earlier findings still apply and are regression-tested:
+        //   * One CD per IDE *unit*. Two on the same unit fails with "Can't create IDE unit 1,
+        //     bus supports only 1 units" — and QEMU creates the QMP socket before exiting, so it
+        //     presents as "running but unresponsive". Separate ports (ide.0, ide.1) are fine.
+        //   * QEMU's argument diagnostics go to stderr while the QMP socket still appears; the
+        //     supervisor reports the unresponsive state rather than inventing a cause, and
+        //     `wvm vm log` points at the real message.
         if let Some(iso) = &self.install_iso {
             a.push("-drive".into());
             a.push(format!(
@@ -225,10 +256,11 @@ impl VmConfig {
                 iso.display()
             ));
             a.push("-device".into());
-            a.push("ide-cd,drive=cd0,bootindex=2".into());
+            a.push("ide-cd,drive=cd0,bus=ide.0,bootindex=2".into());
         }
 
-        // virtio-win drivers, read-only and never bootable.
+        // virtio-win drivers: the disc that makes the virtio devices visible. On its own port, on
+        // the bus Setup can already read. Read-only, and never bootable — it is not an OS.
         if let Some(iso) = &self.driver_iso {
             a.push("-drive".into());
             a.push(format!(
@@ -236,7 +268,7 @@ impl VmConfig {
                 iso.display()
             ));
             a.push("-device".into());
-            a.push("ide-cd,drive=cd1".into());
+            a.push("ide-cd,drive=cd1,bus=ide.1".into());
         }
 
         // Networking: user-mode with an explicit host forward, deliberately NOT bridged. The
@@ -266,8 +298,19 @@ impl VmConfig {
             self.qmp_socket().display()
         ));
 
-        // Do not exit on guest reboot; treat it as a normal guest action.
-        a.push("-no-reboot".to_string());
+        // Whether QEMU exits when the guest reboots.
+        //
+        // Configurable, because the right answer differs by stage and getting it wrong is
+        // disruptive rather than merely suboptimal:
+        //
+        //   * During installation, Windows reboots several times as part of its own process. With
+        //     `-no-reboot`, QEMU exits instead of rebooting the guest, and the install appears to
+        //     vanish. That is exactly what happened on the first real install here.
+        //   * For a long-lived VM, the opposite is wanted: a guest-initiated reboot should not
+        //     silently leave an empty VM behind, so exiting makes the stop visible.
+        if self.no_reboot {
+            a.push("-no-reboot".to_string());
+        }
 
         a
     }
@@ -306,6 +349,7 @@ mod tests {
             guest_port: 48273,
             forward_port: 48274,
             state_dir: Some(PathBuf::from("/tmp/wvm-test/state")),
+            no_reboot: false,
         }
     }
 
@@ -397,19 +441,153 @@ mod tests {
     fn the_driver_iso_is_never_bootable() {
         let mut c = config();
         c.driver_iso = Some(PathBuf::from("/tmp/wvm-test/virtio-win.iso"));
-        // Nested state_dir means validate() will not check the name, but the ISO must exist, so
-        // create a placeholder for the assertion.
         std::fs::write("/tmp/wvm-test/virtio-win.iso", b"x").ok();
 
         let joined = c.qemu_args().join(" ");
         assert!(joined.contains("id=cd1"), "the driver ISO must be attached");
         // The driver ISO appears with no bootindex, unlike the installer CD.
-        let cd1_dev_index = joined.find("ide-cd,drive=cd1").expect("cd1 device");
+        let cd1_dev_index = joined.find("drive=cd1").expect("cd1 device");
         let following = &joined[cd1_dev_index..];
         let end = following.find(" -").unwrap_or(following.len());
         assert!(
             !following[..end].contains("bootindex"),
-            "the driver ISO must not be bootable"
+            "the driver ISO must not be bootable: {}",
+            &following[..end]
+        );
+    }
+
+    #[test]
+    fn discs_go_on_the_ahci_bus_not_virtio_scsi() {
+        // The constraint is a circular dependency, not performance: Windows Setup has no
+        // virtio-scsi driver at install time, so a driver disc on that controller is unreadable
+        // to the Setup that needs it. Both discs must therefore be on AHCI, which Windows reads
+        // out of the box.
+        let mut c = config();
+        c.install_iso = Some(PathBuf::from("/tmp/wvm-test/tiny11.iso"));
+        c.driver_iso = Some(PathBuf::from("/tmp/wvm-test/virtio-win.iso"));
+        std::fs::write("/tmp/wvm-test/tiny11.iso", b"x").ok();
+        std::fs::write("/tmp/wvm-test/virtio-win.iso", b"x").ok();
+
+        let joined = c.qemu_args().join(" ");
+        assert!(
+            !joined.contains("virtio-scsi"),
+            "the discs must not be on virtio-scsi: {joined}"
+        );
+        assert!(joined.contains("ide-cd,drive=cd0"), "{joined}");
+        assert!(joined.contains("ide-cd,drive=cd1"), "{joined}");
+    }
+
+    #[test]
+    fn each_disc_gets_its_own_ide_port() {
+        // Regression, found by running it: q35 gives each IDE *unit* one device, so two discs on
+        // the same unit fails with
+        //   "Can't create IDE unit 1, bus supports only 1 units"
+        // and — because QEMU creates the QMP socket before exiting — the failure presents as
+        // "running but unresponsive" rather than as the error it is.
+        //
+        // Separate ports (ide.0, ide.1) are fine. This is the distinction the earlier version
+        // missed: the limit is per unit, not per bus.
+        let mut c = config();
+        c.install_iso = Some(PathBuf::from("/tmp/wvm-test/tiny11.iso"));
+        c.driver_iso = Some(PathBuf::from("/tmp/wvm-test/virtio-win.iso"));
+        std::fs::write("/tmp/wvm-test/tiny11.iso", b"x").ok();
+        std::fs::write("/tmp/wvm-test/virtio-win.iso", b"x").ok();
+
+        let args = c.qemu_args();
+        let buses: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("ide-cd,drive="))
+            .collect();
+
+        assert_eq!(buses.len(), 2, "both discs should be attached");
+
+        let ports: Vec<&str> = buses
+            .iter()
+            .map(|d| d.split("bus=").nth(1).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            ports.len(),
+            2,
+            "each disc needs an explicit bus, or QEMU picks the same unit for both"
+        );
+        assert_ne!(
+            ports[0], ports[1],
+            "the two discs must be on different units: {ports:?}"
+        );
+    }
+
+    #[test]
+    fn the_installer_stays_bootable_and_the_driver_disc_does_not() {
+        let mut c = config();
+        c.install_iso = Some(PathBuf::from("/tmp/wvm-test/tiny11.iso"));
+        c.driver_iso = Some(PathBuf::from("/tmp/wvm-test/virtio-win.iso"));
+        std::fs::write("/tmp/wvm-test/tiny11.iso", b"x").ok();
+        std::fs::write("/tmp/wvm-test/virtio-win.iso", b"x").ok();
+
+        let joined = c.qemu_args().join(" ");
+        assert!(
+            joined.contains("ide-cd,drive=cd0,bus=ide.0,bootindex=2"),
+            "the installer must be bootable: {joined}"
+        );
+
+        // The driver disc must carry no bootindex, or the guest could boot from a disc of drivers.
+        let cd1 = joined.find("ide-cd,drive=cd1").expect("cd1 device");
+        let end = joined[cd1..].find(" -").unwrap_or(joined.len() - cd1);
+        assert!(
+            !joined[cd1..cd1 + end].contains("bootindex"),
+            "the driver disc must not be bootable: {}",
+            &joined[cd1..cd1 + end]
+        );
+    }
+
+    #[test]
+    fn a_disc_without_a_driver_disc_still_works() {
+        // During installation only the first disc is present, and afterwards the reverse. Neither
+        // should depend on the other's presence.
+        let mut c = config();
+        c.install_iso = Some(PathBuf::from("/tmp/wvm-test/tiny11.iso"));
+        std::fs::write("/tmp/wvm-test/tiny11.iso", b"x").ok();
+
+        let joined = c.qemu_args().join(" ");
+        assert!(
+            joined.contains("ide-cd,drive=cd0,bus=ide.0,bootindex=2"),
+            "{joined}"
+        );
+        assert!(
+            !joined.contains("drive=cd1"),
+            "no driver disc configured: {joined}"
+        );
+
+        let mut c2 = config();
+        c2.driver_iso = Some(PathBuf::from("/tmp/wvm-test/virtio-win.iso"));
+        std::fs::write("/tmp/wvm-test/virtio-win.iso", b"x").ok();
+        let joined2 = c2.qemu_args().join(" ");
+        assert!(joined2.contains("ide-cd,drive=cd1,bus=ide.1"), "{joined2}");
+        assert!(!joined2.contains("drive=cd0"), "{joined2}");
+    }
+
+    #[test]
+    fn no_reboot_is_absent_by_default() {
+        // Regression, found on the first real install: Windows reboots several times during setup.
+        // With `-no-reboot` present, QEMU exits instead of rebooting the guest, so the install
+        // appeared to vanish mid-flight. The default must therefore be "let it reboot".
+        let c = config();
+        let joined = c.qemu_args().join(" ");
+        assert!(
+            !joined.contains("-no-reboot"),
+            "a default VM must reboot when the guest asks: {joined}"
+        );
+    }
+
+    #[test]
+    fn no_reboot_is_honoured_when_asked_for() {
+        // The other half: a long-lived VM may want the opposite, so the flag must still work.
+        let mut c = config();
+        c.no_reboot = true;
+        let joined = c.qemu_args().join(" ");
+        assert!(
+            joined.contains("-no-reboot"),
+            "opting in must add the flag: {joined}"
         );
     }
 

@@ -181,6 +181,15 @@ impl Supervisor {
             .with_context(|| format!("creating {}", self.config.state_dir().display()))?;
 
         if !self.config.disk.exists() {
+            // The disk's parent is NOT necessarily the state directory. An earlier version created
+            // only the state directory and then failed with "No such file or directory" from
+            // qemu-img whenever `disk` pointed somewhere else — which is the normal arrangement,
+            // since the state directory holds runtime files and the disk is user data.
+            if let Some(parent) = self.config.disk.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating the disk directory {}", parent.display()))?;
+            }
+
             let size = format!("{}G", self.config.disk_gib);
             let status = Command::new("qemu-img")
                 .args(["create", "-f", "qcow2"])
@@ -422,6 +431,7 @@ mod tests {
             guest_port: 48273,
             forward_port: 48274,
             state_dir: Some(PathBuf::from(dir)),
+            no_reboot: false,
         }
     }
 
@@ -504,6 +514,40 @@ mod tests {
         s.prepare()
             .expect("prepare should succeed with qemu-img present");
         assert!(c.state_dir().exists());
+    }
+
+    #[test]
+    fn prepare_creates_the_disk_directory_when_it_differs_from_the_state_dir() {
+        // Regression: the earlier version created only the state directory, then handed the disk
+        // path to qemu-img, which failed with "No such file or directory" whenever the disk lived
+        // somewhere else. That is the normal arrangement — state holds runtime files, the disk is
+        // user data — so every earlier test missed it by co-locating the two.
+        let root = scratch("prepare-separate");
+        let state = root.join("state");
+        let data = root.join("data");
+
+        let c = VmConfig {
+            name: "separate".into(),
+            disk: data.join("disk.qcow2"),
+            disk_gib: 1,
+            memory_mib: 1024,
+            cpus: 1,
+            install_iso: None,
+            driver_iso: None,
+            firmware: Firmware::Bios,
+            guest_port: 48273,
+            forward_port: 48274,
+            state_dir: Some(state.clone()),
+            no_reboot: false,
+        };
+
+        let s = Supervisor::new(c.clone());
+        s.prepare()
+            .expect("prepare must create the disk's parent directory");
+
+        assert!(state.exists(), "the state directory should exist");
+        assert!(data.exists(), "the disk's directory should exist");
+        assert!(c.disk.exists(), "the disk image should have been created");
     }
 
     #[test]
