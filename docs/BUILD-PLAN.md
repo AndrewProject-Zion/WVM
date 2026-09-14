@@ -162,33 +162,57 @@ one. See `docs/VM-CONFIG.md`.
 
 ## M4 — Guest service
 
-- [x] `wvm-guest` cross-compiled from Linux (437 KB PE32+, core DLLs only)
+- [x] `wvm-guest` cross-compiled from Linux (440 KB PE32+, core DLLs only)
 - [x] Length-prefixed framing matching the host, transport behind a trait
 - [x] Windows path canonicalisation with containment rules
 - [x] Transfer planning and execution, with overwrite refusal
-- [ ] Install as a Windows service inside a running guest
+- [x] Installer script for registering the service in the guest
+- [ ] Install as a service in the running guest (script written, not yet run)
+- [ ] Verify the guest can reach the host over the forwarded port
 - [ ] Process launch with stdout/stderr capture and exit code
 - [ ] Input injection and framebuffer capture
 - [ ] Wire the transport, paths and transfer modules into `dispatch`
 
 **Verified so far:** the guest binary cross-compiles and imports only `KERNEL32`, `msvcrt`,
 `ntdll`, `WS2_32` and `api-ms-win-core-synch-l1-2-0` — no VC++ redistributable to install inside a
-debloated guest. Path and transfer logic is covered by 36 tests that run on the host.
+debloated guest. The guest crate carries 36 tests, all of which run on the host: 16 for path
+canonicalisation, 13 for transfer containment, and 7 for dispatch. Workspace total: 116.
 
 **Why the platform layer is still stubbed.** `dispatch` returns an explicit
 `{op}: not implemented in this build` for anything needing the guest, and a test asserts that a
 stub never reports success. The transport, path and transfer modules are real and tested; what
-remains is the Win32 layer, which needs a running VM to develop against.
+remains is the Win32 layer.
+
+**The guest now exists to develop against.** Windows 11 (tiny11 2311) is installed and running,
+with Windows Terminal available. See `docs/WINDOWS-INSTALL-STATUS.md` for what was installed and how
+it was verified.
+
+**Next concrete step:** confirm the guest can reach the host's forwarded port
+(`127.0.0.1:48274` on the host → guest `:48273`). That validates the whole transport path before
+any Win32 code is written against it — a two-minute test that de-risks the rest of the milestone.
 
 
 ## M5 — Agent surface
 
-- [ ] Stable request/response contract documented for harnesses
-- [ ] Reference client
+- [x] Reference client (`examples/wvm_client.py`, dependency-free, stdlib only)
+- [x] Capability boundary demonstrable (`wvm_client.py boundary`, exits non-zero on a leak)
+- [ ] Stable request/response contract documented as a standalone reference
 - [ ] Example: drive an installed Windows application end to end, headless
 
-**Verification:** the example runs unattended and produces a journal that reconstructs what
-happened.
+**Verified so far:** the Python client speaks the same wire format as the Rust host and the
+`boundary` subcommand starts its own daemon with an inspect-only grant, then attempts to exceed it:
+
+```
+hello      -> handshake accepted
+inspect    -> inventory: os='host (no guest channel yet)', 0 drive(s), 0 app(s)
+capture    -> REFUSED
+lifecycle  -> REFUSED
+exec       -> REFUSED
+```
+
+Two independent implementations agreeing on framing is what makes this a protocol rather than an
+implementation detail — if Python and Rust ever disagree, the documentation is wrong.
+
 
 ---
 

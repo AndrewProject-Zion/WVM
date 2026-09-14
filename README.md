@@ -215,13 +215,29 @@ forbids is permitted, so it works as a check rather than only as a demo.
 
 ## Status
 
-**Pre-alpha.** Working and verified: the protocol, the capability boundary, the journal, the
-control socket, and QEMU supervision (a VM genuinely boots — the serial console shows OVMF reaching
-the UEFI boot manager). The guest service's path and transfer logic is written and tested; its
-Win32 layer is not yet implemented, and every operation that needs it returns an explicit
-`not implemented` rather than a plausible-looking success.
+**Windows 11 is installed and running** in a guest this project created and booted. The control
+plane, capability boundary and journal are working and verified. The guest service is part-written:
+its path and transfer logic is complete and tested, and what remains is the Win32 layer.
+
+| Milestone | State |
+|---|---|
+| M0 workspace, protocol, capability boundary | done |
+| M1 protocol and framing | done |
+| M2 control socket, policy gate, journal | done |
+| M3 QEMU supervision — boots VMs | done |
+| M4 guest service | part-written; Win32 layer outstanding |
+| M5 agent surface | reference client done |
+
+Verified on a real host, not asserted:
+
+- a VM boots from a tiny11 ISO and Windows Setup runs (driven entirely through QMP input)
+- Windows 11 installs, reboots, and reaches a desktop
+- `snapshot-save` writes VM state into the image (`qemu-img snapshot -l` reads it back)
+- the capability gate refuses ungranted verbs, and journals the refusals
+- 116 tests passing, 0 clippy warnings; the guest cross-compiles to a 440 KB PE32+ binary
 
 See `docs/BUILD-PLAN.md` for the milestone detail and `docs/DECISIONS.md` for the reasoning.
+`docs/WINDOWS-INSTALL-STATUS.md` records the state of the installed guest.
 
 ## docs/
 
@@ -230,19 +246,36 @@ See `docs/BUILD-PLAN.md` for the milestone detail and `docs/DECISIONS.md` for th
 | `BUILD-PLAN.md` | the milestone sequence, with a recorded verification for each |
 | `DECISIONS.md` | D-001..D-006 — what was decided, what was rejected, and why |
 | `VERIFIED-ENVIRONMENT.md` | every host check, with the command that produced it |
+| `WINDOWS-INSTALL-STATUS.md` | what is installed in the guest, and how to run it |
 | `VM-CONFIG.md` | the VM definition reference, including the two-ISO requirement |
+| `INSTALL-WINDOWS.md` | the install runbook |
 | `ORIGINAL-NOTES.txt` | the notes that started the project, preserved as received |
 
 ## scripts/
 
 | Script | Purpose |
 |---|---|
-| `prepare-install.sh` | locate the ISOs, write both configs, create the disk |
-| `install-guest-service.ps1` | install the guest service as a Windows service |
+| `start-windows.sh` | start the installed VM; refuses to double-start |
+| `stop-vms.sh` | stop all QEMU, matching on process name so it cannot self-match |
+| `vm-health.sh` | one command answering "is anything actually wrong?" |
+| `diagnose-qmp-socket.py` | stale socket vs live one, by inode comparison |
+| `qmp_input.py` | drive the guest by keyboard and capture the screen |
+| `vm-with-display.py` | run the daemon's command line with a window |
+| `prepare-install.sh` | locate ISOs, write both configs, create the disk |
+| `install-guest-service.ps1` | install the guest service inside Windows |
+| `fetch-chunked.sh` | chunked download with verified resume |
+| `probe-drive-topology.sh` | test QEMU argument topologies against real QEMU |
+| `status.sh` | repository and VM state at a glance |
 
-`install-guest-service.ps1` registers the service but deliberately does not start it — a control
-service that begins listening before you have decided it should is a bigger step than an installer
-ought to take on your behalf. It prints the command to start it.
+Two of these earn their place from specific failures, and are worth reading if you touch this code:
+
+- **`fetch-chunked.sh`** exists because a resume that is wrong produces a file of the right *size*
+  containing the wrong *bytes*. Every size-based check passes. Its test suite compares against an
+  independently fetched reference, and is mutation-tested.
+- **`diagnose-qmp-socket.py`** separates a stale socket from a live one. A socket file outlives its
+  daemon, and a process can be listening on an inode the filesystem no longer points at —
+  file present, listener present, connections refused. Only an inode comparison explains that.
+
 
 ## Requirements
 
