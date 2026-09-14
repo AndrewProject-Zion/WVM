@@ -1,0 +1,38 @@
+# WVM VM definition.
+#
+# Copy this file, edit the paths, then:
+#   wvm vm validate --config wvm.toml     check it
+#   wvm vm cmdline  --config wvm.toml     read the QEMU command before running it
+#   wvm vm prepare  --config wvm.toml     create the disk image
+#   wvm vm start    --config wvm.toml     boot it
+#
+# Every field is documented in docs/VM-CONFIG.md.
+
+name = "w11"
+
+# The Windows disk. Created by `wvm vm prepare` if absent. qcow2, so snapshots and
+# suspend-to-image work without a separate state file.
+disk = "/var/lib/wvm/w11/disk.qcow2"
+disk_gib = 64
+
+# Give a Windows guest real memory. 4096 is a sane floor; 8192 if the host allows.
+memory_mib = 4096
+cpus = 4
+
+# Installer ISO. Present during installation; comment out afterwards so the VM boots from disk.
+# install_iso = "/path/to/tiny11.iso"
+
+# virtio-win drivers. Windows has no in-box virtio drivers, so without this ISO the guest
+# cannot see its own disk during installation. Attached read-only and never bootable.
+# Get it from https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso
+# driver_iso = "/path/to/virtio-win.iso"
+
+# "uefi" (default) or "bios". tiny11 tolerates either; UEFI is what Windows 11 expects.
+firmware = "uefi"
+
+# The guest service's listening port, and the host port forwarded to it.
+#
+# The forward binds 127.0.0.1 explicitly. The guest must not be reachable from the network, and
+# user-mode networking means it cannot reach the LAN either.
+guest_port = 48273
+forward_port = 48274

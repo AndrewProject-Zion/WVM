@@ -141,3 +141,43 @@ metadata check cannot be avoided, it may add explanation but never decide the ve
 device nodes — all of which are invisible to the obvious permission checks. This applies to every
 check added later, not just KVM.
 
+---
+
+## D-006 — Suspend uses QMP `snapshot-save`, not the familiar `savevm`
+
+**Date:** 2026-09-14
+**Status:** accepted
+
+**Context.** The first implementation of suspend called `savevm` over QMP, because that is the
+command most documentation and every tutorial names. Against a live QEMU it failed:
+
+```
+QMP error for 'savevm': {"class":"CommandNotFound","desc":"The command savevm has not been found"}
+```
+
+**Findings.**
+
+- `savevm` / `loadvm` are **HMP** (human monitor) commands. QMP has a different and explicitly
+  versioned surface, where the equivalents are `snapshot-save` and `snapshot-load`.
+- Querying `query-commands` on this QEMU (11.1.0) confirms it: `snapshot-save`, `snapshot-load`,
+  `snapshot-delete`, `blockdev-snapshot-internal-sync` are all present; `savevm` is not.
+- `snapshot-save` wants the device's **node name** as QEMU knows it, not an assumed `disk0`. It
+  is therefore read back from `query-block` at call time, skipping read-only nodes and the
+  `pflash` firmware devices, which are not valid snapshot targets.
+
+**Alternatives considered.**
+
+1. Shell out to `qemu-monitor-command` with an HMP string — rejected. It reintroduces the string
+   protocol this project removed, and would make the HMP command set a runtime dependency.
+2. Hardcode the device name from the config — rejected. Nothing guarantees QEMU's node name
+   matches the `id=` given on the command line, and a change to the generated arguments would
+   silently break suspend.
+
+**Decision.** Use `snapshot-save`, discovering the target device from `query-block` at call time.
+The command set is verified against the running QEMU rather than assumed.
+
+**Consequence.** A general lesson, recorded because it cost a debugging round: **QMP and HMP are
+different protocols with different command names.** Any QMP implementation must be validated
+against `query-commands` on the actual QEMU build, not written from memory of the HMP console.
+
+---

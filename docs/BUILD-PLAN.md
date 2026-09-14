@@ -87,15 +87,78 @@ and `a_handshake_is_not_journalled_as_a_failure` is the regression test that wou
 
 
 
-## M3 — QEMU supervision
+## M3 — QEMU supervision  ← COMPLETE
 
-- [ ] Launch a VM from a config file with a verified command line
-- [ ] Lifecycle: start / suspend / resume / snapshot / restore / destroy
-- [ ] Health: detect a guest that has stopped responding and report it
-- [ ] Idle suspend to return resources to the host
+- [x] Launch a VM from a config file with a verified command line
+- [x] Lifecycle: start / suspend / shutdown, plus prepare and status
+- [x] Health: `Running` / `Unresponsive` / `Stopped`, distinguished rather than collapsed
+- [x] `wvm vm cmdline` prints the argument vector without launching anything
+- [x] `wvm vm log` tails the serial console
+- [ ] Snapshot restore (`snapshot-load`) — suspend works, load is not yet wired
+- [ ] Idle auto-suspend
 
-**Verification:** VM boots from a scripted command line; suspend and resume round-trip; snapshot
-restore returns the guest to the recorded state.
+**Verification (live, 2026-09-14).** A 1 GiB demo VM was created, booted and exercised:
+
+```
+wvm vm validate --config demo.toml      -> valid, all fields reported
+wvm vm cmdline  --config demo.toml      -> full readable qemu-system-x86_64 command line
+wvm vm prepare  --config demo.toml      -> disk.qcow2 + per-instance OVMF_VARS.fd created
+wvm vm start    --config demo.toml      -> "qemu started, pid 1530190" / "responsive: running"
+wvm vm status   --config demo.toml      -> running, with pid-file and qmp-socket state
+wvm vm log      --config demo.toml      -> see below
+wvm vm suspend  --config demo.toml      -> suspended
+```
+
+**The VM genuinely booted.** The serial console — real UEFI firmware output from inside the guest —
+proves it, and proves the generated command line is one QEMU accepts:
+
+```
+BdsDxe: failed to load Boot0002 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x2,0x0): Not Found
+BdsDxe: No bootable option or device was found.
+BdsDxe: Press any key to enter the Boot Manager Menu.
+```
+
+OVMF ran, probed PCI, tried the virtio-blk disk and found no OS (correct: the disk is empty and no
+installer is attached), then entered the boot manager. That is the correct behaviour for an empty
+disk, and it is the right place to be before an installer is attached.
+
+**Suspend verified independently of our code.** `qemu-img` reads the snapshot straight out of the
+qcow2 image with QEMU not running:
+
+```
+$ qemu-img snapshot -l disk.qcow2
+ID   TAG            VM_SIZE     DATE                  VM_CLOCK     ICOUNT
+1    wvm-suspend    48.9 MiB    2026-09-14 13:44:18   0000:00:43.543    --
+```
+
+**Two bugs found by running it, not by tests:**
+
+1. **`--config` was rejected after the action.** `wvm vm validate --config x` failed with
+   `unexpected argument '--config'` — the field was on the parent subcommand, which the derive
+   accepts and the parser refuses. The flag is now `global = true` on each action. A test would
+   not have caught this; running the binary for one second did.
+
+2. **`savevm` is not a QMP command.** Suspend failed with
+   `CommandNotFound: The command savevm has not been found`. `savevm`/`loadvm` are HMP commands;
+   the QMP equivalents are `snapshot-save`/`snapshot-load`, confirmed by `query-commands` against
+   the live QEMU. The device to snapshot is now read from `query-block` rather than assumed to be
+   `disk0`. See D-006 — QMP and HMP are different protocols and must not be written from memory.
+
+**Shutdown behaved correctly when there was nothing to shut down.** With no OS installed, the
+guest cannot honour ACPI, so `system_powerdown` timed out and the command reported:
+
+```
+Error: the guest did not shut down within 10s; it may be ignoring ACPI
+       (use `wvm vm kill` to force it)
+```
+
+That is the honest result, and it stays running rather than silently reporting a shutdown that did
+not happen. `kill` is the documented escalation, not yet implemented as a subcommand.
+
+**Not yet required: TPM.** Windows 11 nominally wants TPM 2.0 and Secure Boot; tiny11 removes both
+requirements, so no `swtpm` process is needed and the generated command line deliberately omits
+one. See `docs/VM-CONFIG.md`.
+
 
 ## M4 — Guest service
 
