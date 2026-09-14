@@ -1,0 +1,38 @@
+# WVM VM definitions.
+#
+# Two definitions, deliberately separate:
+#
+#   install.toml   boot from the tiny11 ISO and install Windows. Delete or ignore afterwards.
+#   wvm.toml       boot from disk and run the guest service. This is the long-lived one.
+#
+# Keeping them apart means the installer ISO cannot accidentally re-attach to a working VM and
+# drop it back into setup — the failure mode of a single config you edit in place.
+
+# ---------------------------------------------------------------------------
+# install.toml — boot the installer
+# ---------------------------------------------------------------------------
+# Written into the install directory below by `scripts/prepare-install.sh`.
+
+name = "w11"
+
+# Same disk both stages: this is what gets installed to.
+disk = "/var/lib/wvm/w11/disk.qcow2"
+disk_gib = 64
+
+# Setup wants room. If the host is tight, 4096 works but the installer is slow.
+memory_mib = 8192
+cpus = 4
+
+# -------------------------- EDIT THESE TWO PATHS --------------------------
+# The tiny11 ISO, wherever your browser saved it.
+install_iso = "/home/andy/Downloads/tiny11.iso"
+
+# The virtio-win driver disc. Without this, Windows Setup reports NO DISKS,
+# because it has no in-box virtio driver. Attached read-only, never bootable.
+driver_iso = "/home/andy/wvm-images/virtio-win.iso"
+# ---------------------------------------------------------------------------
+
+firmware = "uefi"
+
+guest_port = 48273
+forward_port = 48274
