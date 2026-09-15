@@ -58,13 +58,27 @@ impl Listener {
     }
 }
 
-/// Default bind address: loopback on a fixed port, reachable only over the host↔guest link.
+/// Default bind address for the guest control channel.
 ///
-/// Loopback rather than `0.0.0.0` on purpose. The control channel has no business being
-/// reachable from the guest's own network neighbours, and the host's forward reaches loopback
-/// fine.
+/// `0.0.0.0`, NOT loopback, and the reason is easy to get wrong.
+///
+/// The host reaches the guest through a QEMU user-mode forward (`hostfwd=tcp:127.0.0.1:48274-:48273`).
+/// From the guest's point of view that arrives as an INBOUND connection on its own external
+/// interface — slirp delivers it from the gateway address. It is not a loopback connection and it
+/// never was, however much the `127.0.0.1` on the host side suggests otherwise: that address binds
+/// the host end, and says nothing about where the packet lands inside the guest.
+///
+/// A loopback bind therefore accepts nothing from the host. The symptom is a forward that is
+/// bound and listening on the host, a guest service that reports it started successfully, and a
+/// connection that is refused with no indication which of the three is at fault.
+///
+/// Listening on all interfaces is safe here for a specific, checkable reason rather than by
+/// assumption: the guest sits behind slirp NAT with no port forwards pointing inward, so nothing
+/// outside this host can reach it. The host's forward is the only path in, and it is bound to the
+/// host's loopback. The exposure is the guest's own subnet, which in user-mode networking contains
+/// only the guest itself.
 pub fn default_bind() -> String {
-    "127.0.0.1:48273".to_string()
+    "0.0.0.0:48273".to_string()
 }
 
 pub fn listen(addr: &str) -> Result<Listener> {

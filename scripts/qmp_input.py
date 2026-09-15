@@ -144,16 +144,52 @@ PLAIN = {
 
 
 def send_key(qmp, qom_name, shift=False, ctrl=False, alt=False):
-    """Send one key press. `send-key` does the down+up for us."""
-    keys = []
+    """Send one key press via `input-send-event`, with an explicit press and release.
+
+    This used to use `send-key` with `hold-time: 60`, which holds every key down for 60ms. That is
+    how the reordering bug happened: with a 70ms gap between characters, each key was still held
+    when the next one arrived, and the guest's keyboard driver reordered them. The symptom was
+    characters appearing at the START of a line out of sequence — not dropped, reordered — and it
+    only showed up past about 75 characters, which is what made it look like a line-length limit.
+
+    Measured with scripts/probe-typing-limit.py: 20/30/40/45/50/60/75 characters arrived intact,
+    90 and 110 arrived with stray characters prefixed. The probe disproved "long lines get split",
+    which is what I had assumed.
+
+    `input-send-event` takes discrete down and up events, so the key is released before the next
+    is pressed and there is nothing to reorder. A short hold is still applied (the guest needs to
+    sample the key as down long enough to register it) but it is now well inside the inter-key
+    gap rather than competing with it.
+    """
+    events = []
+
+    # Modifiers down first, in a stable order, then released in reverse after the key.
+    modifiers = []
     if ctrl:
-        keys.append({"type": "qcode", "data": CTRL})
+        modifiers.append(CTRL)
     if alt:
-        keys.append({"type": "qcode", "data": ALT})
+        modifiers.append(ALT)
     if shift:
-        keys.append({"type": "qcode", "data": SHIFT})
-    keys.append({"type": "qcode", "data": qom_name})
-    qmp.execute("send-key", {"keys": keys, "hold-time": 60})
+        modifiers.append(SHIFT)
+
+    for modifier in modifiers:
+        events.append(
+            {"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": modifier}}}
+        )
+
+    events.append({"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": qom_name}}})
+    # A brief hold so the guest registers the press. 12ms is comfortably under the 70ms inter-key
+    # gap used by type_text, so a press is always complete before the next begins.
+    events.append(
+        {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": qom_name}}}
+    )
+
+    for modifier in reversed(modifiers):
+        events.append(
+            {"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": modifier}}}
+        )
+
+    qmp.execute("input-send-event", {"events": events})
 
 
 def chord(qmp, *keys, hold_ms=40):

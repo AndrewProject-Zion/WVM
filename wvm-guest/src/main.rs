@@ -17,6 +17,7 @@ mod dispatch;
 mod paths;
 mod transfer;
 mod transport;
+mod win32;
 
 use anyhow::Result;
 

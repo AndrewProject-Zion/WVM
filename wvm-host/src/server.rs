@@ -360,6 +360,7 @@ fn payload_name(payload: &Payload) -> &'static str {
         Payload::None => "none",
         Payload::Inventory { .. } => "inventory",
         Payload::ProcessExited(_) => "process_exited",
+        Payload::ProcessOutput { .. } => "process_output",
         Payload::Frame { .. } => "frame",
         Payload::Transferred { .. } => "transferred",
         Payload::LifecycleDone { .. } => "lifecycle_done",

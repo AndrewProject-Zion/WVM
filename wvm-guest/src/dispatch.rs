@@ -92,7 +92,44 @@ pub fn handle(request: &Request) -> Response {
             },
         },
 
-        Request::Exec { .. } => not_yet("exec"),
+        Request::Exec {
+            program,
+            args,
+            cwd,
+            require_allowlist: _,
+        } => {
+            // `require_allowlist` is carried to the host, not acted on here. The guest does not
+            // check authority — see the module comment: a second, weaker check creates a place
+            // for the two to disagree.
+            match crate::win32::run(
+                program,
+                args,
+                cwd.as_deref(),
+                crate::win32::DEFAULT_TIMEOUT_MS,
+            ) {
+                Ok(execution) => {
+                    let (outcome, code) = match execution.outcome {
+                        crate::win32::Outcome::Exited { code } => ("exited".to_string(), code),
+                        crate::win32::Outcome::TimedOut { .. } => ("timed_out".to_string(), -1),
+                    };
+                    Response::Ok {
+                        payload: Payload::ProcessOutput {
+                            outcome,
+                            code,
+                            stdout: execution.stdout,
+                            stderr: execution.stderr,
+                            elapsed_ms: execution.elapsed_ms,
+                        },
+                    }
+                }
+                // A failure to launch is an Error, not an Ok with a non-zero code: "there is no
+                // such program" and "the program returned 1" are different answers.
+                Err(e) => Response::Error {
+                    message: format!("exec: {e}"),
+                },
+            }
+        }
+
         Request::Capture { .. } => not_yet("capture"),
         Request::Input { .. } => not_yet("input"),
         Request::Transfer { .. } => not_yet("transfer"),
@@ -181,13 +218,11 @@ mod tests {
     #[test]
     fn unimplemented_operations_report_honestly() {
         // The critical property: a stub must never look like a success.
+        //
+        // `exec` is no longer in this list — it has a real implementation now. On a host build
+        // that implementation cannot run, so it returns an explicit error saying so; that is
+        // covered by `exec_on_a_host_build_refuses_rather_than_pretending`.
         let cases = vec![
-            Request::Exec {
-                program: "c:\\windows\\system32\\cmd.exe".into(),
-                args: vec![],
-                cwd: None,
-                require_allowlist: true,
-            },
             Request::Capture { monitor: 0 },
             Request::Input {
                 event: InputEvent::MouseMove { x: 0, y: 0 },
@@ -212,6 +247,39 @@ mod tests {
                 }
                 other => panic!("a stub must not report success; got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn exec_on_a_host_build_refuses_rather_than_pretending() {
+        // `exec` has a real implementation, but its execution half exists only in a Windows
+        // build. On the host it must say so — an error naming the platform, never an `Ok` with a
+        // fabricated exit code, and never a `not implemented` message that would suggest the
+        // feature is unwritten when it is merely unbuildable here.
+        let req = Request::Exec {
+            program: "c:/windows/system32/cmd.exe".into(),
+            args: vec!["/c".into(), "echo".into(), "hi".into()],
+            cwd: None,
+            require_allowlist: true,
+        };
+
+        match handle(&req) {
+            Response::Error { message } => {
+                if cfg!(windows) {
+                    // In a real guest this should have run; reaching an error here means something
+                    // is wrong with the command, not with the platform.
+                    panic!("exec failed inside a Windows guest: {message}");
+                }
+                assert!(
+                    message.contains("Win32 execution layer"),
+                    "the refusal must name what is missing: {message}"
+                );
+                assert!(
+                    !message.contains("not implemented"),
+                    "exec is implemented; only its platform half is absent here: {message}"
+                );
+            }
+            other => panic!("a platform-absent exec must not report success; got {other:?}"),
         }
     }
 

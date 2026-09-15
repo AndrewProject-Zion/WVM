@@ -17,18 +17,64 @@
 
 [CmdletBinding()]
 param(
-    # Where the cross-compiled binary is. Defaults to beside this script.
-    [string]$Source = (Join-Path $PSScriptRoot 'wvm-guest.exe'),
+    # Where the cross-compiled binary is. Empty means "look beside this script and in the current
+    # directory" — resolved in the body rather than here, because a default that calls Join-Path
+    # on $PSScriptRoot fails at PARAMETER BINDING time when $PSScriptRoot is empty, before a
+    # single line of the script runs.
+    #
+    # That is a real failure this hit: the download came via curl, $PSScriptRoot was empty, and the
+    # error surfaced as a Join-Path binding error with no indication that the default was at fault.
+    # The script appeared to do nothing at all, and no transcript was written because binding
+    # failed before the transcript could start.
+    [string]$Source = '',
 
     # Must match guest_port in the host's VM config, or the forward lands on nothing.
     [int]$Port = 48273,
 
     # Where the service binary lives once installed.
-    [string]$InstallDir = 'C:\Program Files\wvm'
+    [string]$InstallDir = 'C:\Program Files\wvm',
+
+    # Write a transcript here. Set by the bootstrap so the result survives the elevated window
+    # closing — an elevated console cannot be read once the process has exited, and losing the
+    # output is how an install failure becomes indistinguishable from a silent success.
+    [string]$Log = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $serviceName = 'wvm-guest'
+
+# Resolve the source explicitly, trying every plausible place in order. This runs after binding,
+# so it works regardless of how the script was invoked.
+if ([string]::IsNullOrEmpty($Source)) {
+    $candidates = @()
+
+    # Beside the script, if PowerShell knows where that is.
+    if (-not [string]::IsNullOrEmpty($PSScriptRoot)) {
+        $candidates += (Join-Path $PSScriptRoot 'wvm-guest.exe')
+    }
+    # The current directory, and the directory the bootstrap uses.
+    $candidates += (Join-Path (Get-Location).Path 'wvm-guest.exe')
+    if (-not [string]::IsNullOrEmpty($env:USERPROFILE)) {
+        $candidates += (Join-Path $env:USERPROFILE 'wvm\wvm-guest.exe')
+        $candidates += (Join-Path $env:USERPROFILE 'wvm-guest.exe')
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            $Source = $candidate
+            break
+        }
+    }
+}
+
+# Start the transcript before anything can fail, so an early exit is still recorded.
+if ($Log -ne '') {
+    try {
+        Start-Transcript -Path $Log -Force | Out-Null
+    } catch {
+        Write-Host "  (could not start a transcript at $Log : $_)"
+    }
+}
 
 # --- require elevation -------------------------------------------------------------------------
 #
@@ -136,13 +182,53 @@ if (-not $installed) {
     exit 1
 }
 
+# --- start it and confirm it is actually listening ---------------------------------------------
+#
+# Started here rather than left to the operator, because "registered" and "working" are different
+# claims and only the second one matters. A service that starts and then exits immediately looks
+# identical to a healthy one in the service list if nobody checks.
+
+Write-Host "  starting    the service"
+Start-Service -Name $serviceName
+
+$installed.WaitForStatus('Running', (New-Object TimeSpan 0, 0, 30))
+
+if ($installed.Status -ne 'Running') {
+    Write-Error "The service did not reach 'Running' (status: $($installed.Status))."
+    exit 1
+}
+Write-Host "  service     running"
+
+# Confirm something is bound to the port, from inside the guest. This is the check that
+# distinguishes "the process started" from "the control channel is open" — and it is the one that
+# would have caught the loopback-bind bug, where the service ran happily and accepted nothing.
+$deadline = (Get-Date).AddSeconds(15)
+$listening = $false
+while ((Get-Date) -lt $deadline -and -not $listening) {
+    $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if ($conn) { $listening = $true } else { Start-Sleep -Milliseconds 500 }
+}
+
+if (-not $listening) {
+    Write-Error @"
+The service is running but nothing is listening on port $Port.
+
+The usual cause is a bind address of 127.0.0.1. The host reaches this service through a QEMU
+forward, which arrives as an INBOUND connection on the guest's external interface, never on
+loopback. The service must bind 0.0.0.0.
+"@
+    exit 1
+}
+
+$bound = (Get-NetTCPConnection -LocalPort $Port -State Listen | Select-Object -First 1).LocalAddress
+Write-Host "  listening   $bound`:$Port"
+
 Write-Host ""
-Write-Host "Installed. The service is registered but NOT started."
+Write-Host "Installed and running."
 Write-Host ""
-Write-Host "  start it:   Start-Service $serviceName"
-Write-Host "  check it:   Get-Service $serviceName"
-Write-Host "  its log:    Get-EventLog -LogName Application -Source $serviceName -Newest 20"
-Write-Host "  remove it:  Stop-Service $serviceName; sc.exe delete $serviceName"
+Write-Host "  verify from the host:   python3 scripts/talk-to-guest.py hello"
+Write-Host "  stop it:                Stop-Service $serviceName"
+Write-Host "  remove it:              Stop-Service $serviceName; sc.exe delete $serviceName"
 Write-Host ""
 Write-Host "  listening on 0.0.0.0:$Port; the host reaches it via 127.0.0.1:<forward_port>"
 Write-Host ""
@@ -150,3 +236,10 @@ Write-Host "Wiring if a connection is refused from the host:"
 Write-Host "  1. is the service running?          Get-Service $serviceName"
 Write-Host "  2. is it listening?                 Get-NetTCPConnection -LocalPort $Port -State Listen"
 Write-Host "  3. does guest_port match the host?  the host forwards to this exact port"
+
+# Flush the transcript. Without this the log file never gets its final contents, and the output of
+# a run that is claimed to have succeeded is exactly what is needed when it later turns out not to
+# have worked.
+if ($Log -ne '') {
+    try { Stop-Transcript | Out-Null } catch { }
+}

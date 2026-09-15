@@ -381,6 +381,25 @@ pub enum Payload {
     },
     /// A finished process.
     ProcessExited(i32),
+    /// A finished process, with what it printed.
+    ///
+    /// `ProcessExited` alone cannot describe the thing callers actually want: what a command
+    /// produced. Without captured output an `exec` can report that something ran while giving no
+    /// way to see what it said, which for a control plane is most of the value.
+    ///
+    /// `outcome` is a string rather than an enum so this crate stays independent of the guest's
+    /// platform types, and so an unknown outcome from a newer guest is reported rather than
+    /// rejected by an older host. The host treats anything it does not recognise as a failure it
+    /// does not understand, which is the safe reading.
+    ProcessOutput {
+        /// `exited` or `timed_out`.
+        outcome: String,
+        /// Exit status when `outcome` is `exited`; -1 when the process ended without one.
+        code: i32,
+        stdout: String,
+        stderr: String,
+        elapsed_ms: u64,
+    },
     /// A captured frame, base64-encoded PNG. Size is bounded by the frame limit.
     Frame {
         png_base64: String,
