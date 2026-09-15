@@ -448,3 +448,62 @@ channel, and a future revision should consider a watchdog that can abandon a req
 the service.
 
 ---
+
+## D-013 — A timeout kills the process tree, via a Job Object on Windows
+
+**Date:** 2026-09-15
+**Status:** accepted, verified both ways against a live guest
+
+**Context.** `exec` supports a caller-supplied timeout. When it fired, the guest called
+`Child::kill()` — which on Windows is `TerminateProcess` on **one** process. Anything that process
+had spawned survived it.
+
+A command that shells out is the normal case, not the exotic one: a build script, a pipeline, an
+agent running `cmd /c something.bat`. Timing out killed the shell and left its children running —
+orphaned, invisible to the control channel, still holding memory and handles. Once is harmless;
+repeatedly it exhausts the guest's resources, and the failure surfaces much later as an unrelated
+problem. This is how a worker node gets bricked by its own workload.
+
+**Finding.** The POSIX answer does not port. On Linux the recipe is `setpgid` at spawn plus
+`kill(-pgid)`: signal the negative PID and the kernel delivers it to every member of the group.
+Windows has no negative PID and no signal that reaches a tree, so there is nothing to translate —
+the mechanism itself is absent.
+
+**Decision.** A **Job Object** with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, created before the child
+and with the child assigned immediately after spawn. Dropping the last handle terminates every
+process in the job, and **job membership is inherited** — which is what makes grandchildren die and
+not merely children.
+
+**Known window, recorded rather than described away.** Between `spawn` returning and
+`AssignProcessToJobObject` succeeding there is a moment where the process exists outside the job. If
+the timeout fired in that window the kill would miss, and the resulting failure would be rare and
+unreproducible. `CREATE_SUSPENDED` + `AssignProcessToJobObject` + `ResumeThread` closes it
+completely, and `std::process` does not expose that. The window is microseconds and the child
+executes nothing meaningful inside it, so this is accepted for now and named here so the next person
+can judge it rather than discover it.
+
+**Verification, in both directions.** `scripts/test-timeout-tree-kill.py` spawns a script that
+starts two grandchildren which outlive their parent, times it out, and counts survivors by asking the
+guest for its process list.
+
+- Job object active: `timed_out` reported, **zero survivors**, three repeat runs clean, channel
+  still healthy afterwards.
+- Job kill disabled: the channel **wedges outright**. The orphans hold the pipe handles open, so the
+  drain threads never see EOF and the host times out entirely.
+
+That second result is the point worth keeping: the leak is not merely "memory fills up eventually".
+**A single hostile command can hang the control plane**, which is a far more immediate failure than
+the resource exhaustion that prompted the fix.
+
+**A test that nearly passed for the wrong reason.** The first version reported a clean pass having
+tested nothing — `outcome: exited` rather than `timed_out`, in 82ms, with
+`ERROR: Input redirection is not supported, exiting the process immediately.` on stderr. The obvious
+Windows stand-in for `sleep 600` is `timeout /t 600`, and it **refuses to run when stdin is
+redirected**, which the guest always does. Every delay exited instantly, no grandchild ever existed,
+and every survivor count was zero for the absence of anything to count. `ping -n` works under
+redirected stdin and is still a real child process.
+
+**Consequence.** Any future guest-side operation that spawns processes must put them in a job. The
+pattern is in `wvm-guest/src/job.rs` and is not specific to `exec`.
+
+---

@@ -35,7 +35,7 @@ guest, which is the point of cross-compiling with the GNU toolchain.
 - [x] Capability grant type with verbs as a closed enum
 - [x] Round-trip tests including malformed and oversized frames
 
-**Verification:** 17 tests in `wvm-ipc`, covering empty payloads, sequential frames staying
+**Verification:** 18 tests in `wvm-ipc`, covering empty payloads, sequential frames staying
 aligned, clean-EOF-vs-truncation, an oversized header refused *before* allocation, and a
 `deny_all` grant refusing every verb.
 
@@ -232,7 +232,9 @@ See `docs/WINDOWS-INSTALL-STATUS.md` for what is installed in the guest and how 
 - [x] `capture` — PNG of the live desktop, from the host framebuffer (D-009)
 - [x] `input` — absolute pointer moves and clicks, UK-correct keys and text (D-010, D-011)
 - [x] WVM-01 fixed — execution pipes drained concurrently, not after exit
-- [ ] `transfer` — move files between host and guest
+- [x] `transfer push` — host to guest, chunked in lockstep (D-012)
+- [x] `transfer pull` — guest to host, so an agent can extract what it produced
+- [x] `exec` timeout kills the process TREE, not just the direct child (D-013)
 - [ ] `lifecycle` — snapshot and restore
 - [ ] Stable request/response contract documented as a standalone reference
 - [ ] Example: drive an installed Windows application end to end, headless

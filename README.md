@@ -13,9 +13,9 @@ WinPodX, winapps, LinOffice all put individual Windows windows on a Linux deskto
 RemoteApp. WVM exists for the case they do not cover: **an agent or a program driving a Windows
 guest over a typed protocol, headless, with an auditable capability boundary.**
 
-**Status: M5 in progress.** `exec`, `capture` and `input` are implemented and verified against a
-live guest. `transfer` is **partially built and does not work end to end** — see
-[Known gaps](#known-gaps-recorded-rather-than-hidden). `lifecycle` is a stub.
+**Status: M5 in progress.** `exec`, `capture`, `input`, `transfer push` and `transfer pull` are
+implemented and verified against a live guest. `lifecycle` is an honest stub that reports
+`not implemented in this build`.
 
 ## What works, verified
 
@@ -31,10 +31,13 @@ exec     ->  {"result":"process_output","outcome":"exited","code":0,
 capture  ->  a 1024x768 PNG of the live desktop, 608 distinct colours
 
 input    ->  clicked (336,397) on the Firefox new tab page; Wikipedia loaded
+
+transfer ->  1 MiB pushed in and pulled back, byte-identical both ways
 ```
 
 A process launched inside Windows, its output captured, returned to the host. A screenshot of the
-real desktop. A click that lands where you aimed.
+real desktop. A click that lands where you aimed. **And an artifact the guest produced, extracted
+and hash-verified** — which is the difference between a sandbox and a roach motel.
 
 | | |
 |---|---|
@@ -45,10 +48,11 @@ real desktop. A click that lands where you aimed.
 | Windows install | tiny11, driven by keyboard injection alone, headless |
 | Guest networking | e1000e (in-box driver), `10.0.2.15` |
 | Guest service | Windows service, `StartServiceCtrlDispatcher`, auto-restart |
-| Exec | launch, capture stdout/stderr, timeout, exit status |
+| Exec | launch, capture stdout/stderr, caller-supplied timeout, exit status |
+| Exec cleanup | a timeout kills the whole process **tree**, not just the direct child |
 | Capture | PNG of the live desktop, geometry assertion |
 | Input | absolute pointer moves and clicks, UK-correct keys and text |
-| Transfer | **not working** — the verb and boundary exist; contents do not move yet |
+| Transfer | push and pull, chunked in lockstep, confined to a guest staging root |
 
 ## Not yet built
 
@@ -61,19 +65,15 @@ It has its plumbing in place and a test asserting a stub never reports success.
 
 ## Known gaps, recorded rather than hidden
 
-- **`transfer` does not move file contents yet.** The verb, the chunking and the containment
-  boundary are built and tested, and the boundary correctly refuses a path outside the staging root.
-  But a live run fails at the file read:
-
-  ```
-  transfer: reading metadata for '/tmp/wvm-roundtrip-out.bin'
-  ```
-
-  **The guest is trying to open the host's path**, and it cannot — there is no shared filesystem
-  between host and guest, deliberately. (The original project mounted the host's `/` into the guest
-  as a writable `Z:\`; this is the design decision that avoids it.) The bytes have to travel over
-  the protocol, so the **host** must be the reader for a push. Fixing this needs a file-chunk
-  payload on the wire, which is a design change worth deciding deliberately rather than bolting on.
+- **A request that ignores its deadline still holds the channel.** The guest answers one request at a
+  time, and `exec` takes a caller-supplied timeout, so a hung command is bounded. But the general
+  case is not solved: a request that neither returns nor respects its own deadline occupies the
+  control channel until something kills it. A watchdog able to abandon a request without restarting
+  the service is the follow-up (D-013).
+- **The tree-kill has a microseconds-wide window.** The child is assigned to its job object
+  immediately after `spawn`, so there is a moment where a process exists outside the job. Closing it
+  needs `CREATE_SUSPENDED` + `AssignProcessToJobObject` + `ResumeThread`, which `std::process` does
+  not expose. Named rather than described away — see D-013.
 - **A guest without a display cannot be captured.** Capture runs against the QEMU framebuffer on the
   host, so it needs QEMU to be rendering. That is inherent, not a bug — and it is why capture is
   host-side at all (see D-009).
@@ -184,11 +184,20 @@ confusing "positional parameter" error.
 python3 scripts/talk-to-guest.py hello
 python3 scripts/talk-to-guest.py exec -- cmd.exe /c ver
 
-# the host binary also does capture and input
+# the host binary also does capture, input and file transfer
 wvm vm capture  --config ~/wvm/wvm.toml --out /tmp/screen.png --expect 1024x768
 wvm vm input    click --config ~/wvm/wvm.toml 336 397
 wvm vm input    text  --config ~/wvm/wvm.toml 'hello from the host'
+
+# move a file in, and get an artifact back out
+wvm vm transfer push --config ~/wvm/wvm.toml ./payload.bin 'C:\ProgramData\wvm\staging\payload.bin'
+wvm vm transfer pull --config ~/wvm/wvm.toml 'C:\ProgramData\wvm\staging\result.bin' ./result.bin
 ```
+
+Note the argument order for `pull`: the names are written for a push, so they **invert**. `SOURCE`
+is the **guest** file being fetched and `GUEST_PATH` is the **host** destination. Getting it
+backwards sends your local path to the guest, which refuses it as outside its staging root — an
+error that looks like a boundary problem rather than a swapped argument.
 
 ## Why Tiny11
 
