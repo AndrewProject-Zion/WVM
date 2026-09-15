@@ -13,9 +13,9 @@ WinPodX, winapps, LinOffice all put individual Windows windows on a Linux deskto
 RemoteApp. WVM exists for the case they do not cover: **an agent or a program driving a Windows
 guest over a typed protocol, headless, with an auditable capability boundary.**
 
-**Status: M5 in progress.** `exec`, `capture`, `input` and `transfer` are implemented and verified
-against a live guest. `lifecycle` is an honest stub that reports `not implemented in this build` —
-see [Known gaps](#known-gaps-recorded-rather-than-hidden).
+**Status: M5 in progress.** `exec`, `capture` and `input` are implemented and verified against a
+live guest. `transfer` is **partially built and does not work end to end** — see
+[Known gaps](#known-gaps-recorded-rather-than-hidden). `lifecycle` is a stub.
 
 ## What works, verified
 
@@ -31,12 +31,10 @@ exec     ->  {"result":"process_output","outcome":"exited","code":0,
 capture  ->  a 1024x768 PNG of the live desktop, 608 distinct colours
 
 input    ->  clicked (336,397) on the Firefox new tab page; Wikipedia loaded
-
-transfer ->  a file moved into the guest, chunked, confined to a staging root
 ```
 
 A process launched inside Windows, its output captured, returned to the host. A screenshot of the
-real desktop. A click that lands where you aimed. A file the guest wrote, or refused to write.
+real desktop. A click that lands where you aimed.
 
 | | |
 |---|---|
@@ -50,7 +48,7 @@ real desktop. A click that lands where you aimed. A file the guest wrote, or ref
 | Exec | launch, capture stdout/stderr, timeout, exit status |
 | Capture | PNG of the live desktop, geometry assertion |
 | Input | absolute pointer moves and clicks, UK-correct keys and text |
-| Transfer | chunked, confined to a guest staging root |
+| Transfer | **not working** — the verb and boundary exist; contents do not move yet |
 
 ## Not yet built
 
@@ -63,6 +61,19 @@ It has its plumbing in place and a test asserting a stub never reports success.
 
 ## Known gaps, recorded rather than hidden
 
+- **`transfer` does not move file contents yet.** The verb, the chunking and the containment
+  boundary are built and tested, and the boundary correctly refuses a path outside the staging root.
+  But a live run fails at the file read:
+
+  ```
+  transfer: reading metadata for '/tmp/wvm-roundtrip-out.bin'
+  ```
+
+  **The guest is trying to open the host's path**, and it cannot — there is no shared filesystem
+  between host and guest, deliberately. (The original project mounted the host's `/` into the guest
+  as a writable `Z:\`; this is the design decision that avoids it.) The bytes have to travel over
+  the protocol, so the **host** must be the reader for a push. Fixing this needs a file-chunk
+  payload on the wire, which is a design change worth deciding deliberately rather than bolting on.
 - **A guest without a display cannot be captured.** Capture runs against the QEMU framebuffer on the
   host, so it needs QEMU to be rendering. That is inherent, not a bug — and it is why capture is
   host-side at all (see D-009).
@@ -173,11 +184,10 @@ confusing "positional parameter" error.
 python3 scripts/talk-to-guest.py hello
 python3 scripts/talk-to-guest.py exec -- cmd.exe /c ver
 
-# the host binary also does capture, input and transfer
+# the host binary also does capture and input
 wvm vm capture  --config ~/wvm/wvm.toml --out /tmp/screen.png --expect 1024x768
 wvm vm input    click --config ~/wvm/wvm.toml 336 397
 wvm vm input    text  --config ~/wvm/wvm.toml 'hello from the host'
-wvm vm transfer push  --config ~/wvm/wvm.toml ./artifact.bin 'C:\ProgramData\wvm\staging\artifact.bin'
 ```
 
 ## Why Tiny11
