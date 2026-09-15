@@ -21,8 +21,17 @@ pub fn serve<C: Connection>(mut conn: C) -> Result<()> {
     loop {
         let bytes = match conn.recv() {
             Ok(b) => b,
-            // A clean close at a frame boundary is a normal end of session.
-            Err(_) => return Ok(()),
+            Err(e) => {
+                // Logged before returning, because this arm turns EVERY read failure into a clean
+                // disconnect: the host sees its request vanish with no reply and no way to tell why.
+                //
+                // That is deliberate for a peer that simply goes away, and it is the wrong shape for
+                // a read that fails mid-frame — the two are indistinguishable to the caller. The log
+                // line is the difference: a genuine disconnect is uninteresting, a mid-frame failure
+                // is a bug worth seeing.
+                crate::log::probe(&format!("connection ended: {e}"));
+                return Ok(());
+            }
         };
 
         let request: Request = match serde_json::from_slice(&bytes) {

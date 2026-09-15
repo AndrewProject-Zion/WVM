@@ -17,6 +17,7 @@ mod base64;
 mod capture;
 mod dispatch;
 mod fsio;
+mod log;
 mod paths;
 mod transfer;
 mod transport;
@@ -28,6 +29,12 @@ mod service;
 use anyhow::Result;
 
 fn main() -> Result<()> {
+    // Route the shared crate's framing diagnostics into this binary's log file.
+    //
+    // Without this, wvm-ipc's read loop has nowhere to report and stays silent — which is how a
+    // large frame disappeared with no evidence at all.
+    wvm_ipc::set_frame_debug(crate::log::probe);
+
     let args: Vec<String> = std::env::args().collect();
 
     // Service mode: hand over to the SCM dispatcher, which calls back into `service::service_main`

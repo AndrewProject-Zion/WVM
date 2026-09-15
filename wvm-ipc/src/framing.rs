@@ -18,6 +18,24 @@
 
 use std::io::{self, Read, Write};
 
+/// Where framing diagnostics go, if anyone is listening.
+///
+/// `wvm-ipc` is shared by the host and the guest, so it cannot depend on the guest's file logger.
+/// Instead the binary that wants the diagnostics installs a sink. Unset means silent, which is the
+/// right default: a library should not print.
+static FRAME_DEBUG: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Install the diagnostic sink. Call once, at startup, from whichever binary wants the output.
+pub fn set_frame_debug(sink: fn(&str)) {
+    let _ = FRAME_DEBUG.set(sink);
+}
+
+fn frame_debug(message: &str) {
+    if let Some(sink) = FRAME_DEBUG.get() {
+        sink(message);
+    }
+}
+
 /// Largest payload accepted, in bytes. 64 MiB is comfortably above a full-screen PNG frame and
 /// far below anything that would be reasonable to buffer per message.
 pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
@@ -124,14 +142,31 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<Vec<u8>, FrameError> {
 
     let mut payload = vec![0u8; len as usize];
     let mut got = 0usize;
+    // A declared payload is read in however many `read()` calls the socket needs, accumulated here
+    // until complete. Worth knowing about this loop: it was instrumented during the investigation
+    // into a reported large-frame failure, and the instrumentation showed the loop was fine — the
+    // failure was a service in a broken state, not the read path. The sink (`set_frame_debug`) is
+    // kept because it is how that was established, and it costs nothing when unset.
     while got < payload.len() {
         match r.read(&mut payload[got..]) {
             Ok(0) => {
                 return Err(FrameError::Truncated { expected: len, got });
             }
-            Ok(n) => got += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(FrameError::Io(e)),
+            Ok(n) => {
+                got += n;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                continue;
+            }
+            Err(e) => {
+                // A read that fails part-way through a payload. Reported through the sink so a
+                // binary that installed one can see it; the error itself still propagates, because
+                // a truncated frame is not something to retry or paper over.
+                frame_debug(&format!(
+                    "read failed after {got} of {len} payload bytes: {e:?}"
+                ));
+                return Err(FrameError::Io(e));
+            }
         }
     }
 
@@ -158,6 +193,48 @@ mod tests {
         write_frame(&mut buf, msg).unwrap();
         let mut c = Cursor::new(buf);
         assert_eq!(read_frame(&mut c).unwrap(), msg.as_slice());
+    }
+
+    /// A frame of a real transfer chunk must round-trip intact.
+    ///
+    /// **The test the transfer design rests on.** A 256 KiB binary chunk base64-encodes to roughly
+    /// 341 KiB, and the D-012 decision (base64 inside JSON rather than multiplexed binary frames)
+    /// assumes that payload survives as ONE frame. If it did not, the carrier choice would be wrong
+    /// and every line of file-assembly written on top of it would be wasted.
+    ///
+    /// It exists because a live probe once reported a 358 KB frame getting NO REPLY, and that was
+    /// briefly believed to be a size limit on the read path. It was not: the probe had run against a
+    /// service left in a broken state by a botched deploy, and the identical frame succeeds against
+    /// a healthy one, reproducibly, five times out of five. **The measurement was wrong, not the
+    /// transport.**
+    ///
+    /// This pins the property so a real limit cannot hide behind that confusion again. Written as a
+    /// Cursor rather than a socket on purpose: this asserts the framing, which is the part being
+    /// decided here. Whether a socket delivers it is a separate question, answered against a live
+    /// guest by `scripts/probe-frame-size.py`.
+    #[test]
+    fn a_transfer_sized_frame_round_trips() {
+        // 256 KiB of varying bytes, base64-encoded, inside a JSON body: the shape of a real chunk.
+        // Varying content matters — a run of identical bytes survives truncation and offset bugs.
+        let raw: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let encoded = crate::base64_encode_for_test(&raw);
+        let body =
+            format!(r#"{{"chunk_base64":"{encoded}","offset":0,"final":true}}"#).into_bytes();
+
+        assert!(
+            body.len() > 340 * 1024,
+            "the frame must be transfer-sized or this proves nothing; got {}",
+            body.len()
+        );
+
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &body).unwrap();
+        assert_eq!(buf.len(), 4 + body.len(), "4-byte header, then the payload");
+
+        let mut c = Cursor::new(buf);
+        let got = read_frame(&mut c).expect("a transfer-sized frame must be read");
+        assert_eq!(got.len(), body.len(), "the whole payload must arrive");
+        assert_eq!(got, body, "and byte-for-byte identical");
     }
 
     #[test]
