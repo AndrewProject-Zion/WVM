@@ -105,10 +105,41 @@ SHIFTED = {
     ">": ("dot", True), "?": ("slash", True), "~": ("grave_accent", True),
 }
 
+# Modifier names, verified against this QEMU by scripts/probe-keynames.sh rather than assumed.
+# The probe rejected `ctrl_l` and `enter`, so the accepted list is meaningful:
+#   ctrl  ctrl_r  shift  shift_r  alt  alt_r  meta_l  meta_r
+CTRL = "ctrl"
+SHIFT = "shift"
+ALT = "alt"
+META = "meta_l"
+
+# Plain (unshifted) characters and their QOM keycode names.
+#
+# MEASURED on this guest (UK layout), not assumed. scripts/probe-keynames.sh confirmed which names
+# QEMU accepts; a labelled round trip in the guest (type "0<key>1<key>...", read the echo with
+# vision) confirmed what each one actually produces:
+#
+#   grave_accent  -> `
+#   apostrophe    -> '        semicolon -> ;        bracket_left  -> [
+#   bracket_right -> ]        minus     -> -        equal         -> =
+#   comma         -> ,        dot       -> .        slash         -> /
+#   backslash     -> #        (US physical position, which on UK is `#`)
+#   yen           -> @
+#   kp_divide     -> /
+#
+# There is NO name that produces a literal backslash on this layout. Rather than guess further,
+# callers avoid the character: Windows accepts forward slashes in paths, so `E:/NetKVM/w11/...`
+# works wherever `E:\NetKVM\w11\...` would. `PLAIN` therefore maps `\` to `slash` — documented,
+# deterministic, and correct for the use that matters. Anything that genuinely requires a backslash
+# must be rewritten to use a forward slash.
 PLAIN = {
     " ": "spc", "-": "minus", "=": "equal", "[": "bracket_left", "]": "bracket_right",
-    "\\": "backslash", ";": "semicolon", "'": "apostrophe", ",": "comma",
-    ".": "dot", "/": "slash", "`": "grave_accent",
+    # See note above: no keycode yields a literal backslash here. `/` is accepted by Windows APIs,
+    # and the previous attempts (`backslash` -> `#`) produced mangled paths whose error message
+    # blamed the driver rather than the keystroke.
+    "\\": "slash",
+    ";": "semicolon", "'": "apostrophe", ",": "comma", ".": "dot", "/": "slash",
+    "`": "grave_accent",
 }
 
 
@@ -116,13 +147,43 @@ def send_key(qmp, qom_name, shift=False, ctrl=False, alt=False):
     """Send one key press. `send-key` does the down+up for us."""
     keys = []
     if ctrl:
-        keys.append({"type": "qcode", "data": "ctrl"})
+        keys.append({"type": "qcode", "data": CTRL})
     if alt:
-        keys.append({"type": "qcode", "data": "alt"})
+        keys.append({"type": "qcode", "data": ALT})
     if shift:
-        keys.append({"type": "qcode", "data": "shift"})
+        keys.append({"type": "qcode", "data": SHIFT})
     keys.append({"type": "qcode", "data": qom_name})
     qmp.execute("send-key", {"keys": keys, "hold-time": 60})
+
+
+def chord(qmp, *keys, hold_ms=40):
+    """Press keys simultaneously, holding modifiers down across the whole chord.
+
+    `send-key` cannot express this: it presses everything given and releases it again, so a
+    combination like Meta+R arrives as Meta-down, Meta-up, R-down, R-up — which Windows reads as
+    the Start menu opening and then a stray 'r', not as the Run dialog.
+
+    `input-send-event` does model press/release separately, so the chord is built as explicit
+    down events for the modifiers, the key, then up events in reverse order. This is the form that
+    actually works for accelerator keys.
+    """
+    events = []
+    for key in keys[:-1]:
+        events.append({"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": key}}})
+    last = keys[-1]
+    events.append({"type": "key", "data": {"down": True, "key": {"type": "qcode", "data": last}}})
+    events.append({"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": last}}})
+    for key in reversed(keys[:-1]):
+        events.append({"type": "key", "data": {"down": False, "key": {"type": "qcode", "data": key}}})
+
+    qmp.execute("input-send-event", {"events": events})
+    # A short settle: the guest's input stack needs a moment between chords.
+    time.sleep(hold_ms / 1000.0)
+
+
+def press(qmp, qom_name):
+    """Press and release a single key via input-send-event, for consistency with `chord`."""
+    chord(qmp, qom_name)
 
 
 def key(qmp, name):
@@ -156,13 +217,61 @@ def type_char(qmp, ch):
         raise ValueError(f"no mapping for character {ch!r}")
 
 
-def type_text(qmp, text):
+def type_text(qmp, text, delay_ms=60, settle_ms=120):
+    """Type a string, pacing it so the guest keeps up.
+
+    The delay is not cosmetic. At 20ms between keys, roughly a dozen characters were silently
+    dropped at the start of a typed command and a stray character appeared at the end — the guest's
+    input stack, the PS/2 controller and the console host all buffer, and a burst overruns them.
+    The visible result is a command that is subtly wrong with no error explaining why, which is the
+    worst kind of failure to debug.
+
+    60ms is comfortable. Verified by checking the guest's echo against what was sent rather than
+    assuming the text arrived intact.
+    """
     for ch in text:
         type_char(qmp, ch)
-        # A small gap between keys. Not strictly necessary, but a burst of events with no delay
-        # can arrive faster than the guest's input stack drains, and the symptom is dropped
-        # characters rather than an error.
-        time.sleep(0.02)
+        time.sleep(delay_ms / 1000.0)
+
+    # A pause before Enter, so it cannot be consumed as part of the burst.
+    time.sleep(settle_ms / 1000.0)
+
+
+def type_command(qmp, command, verify_echo=True):
+    """Type a command line, press Enter, and (optionally) report what was sent.
+
+    The caller is expected to compare the guest's echo against `command` — the interpreter here is
+    the guest's own console, and a mismatch there is the only reliable proof the keystrokes landed.
+    """
+    type_text(qmp, command)
+    press(qmp, "ret")
+    if verify_echo:
+        # Recorded so a caller can diff it against the guest's screen.
+        return command
+    return None
+
+
+def run_dialog(qmp, command, clear_first=True):
+    """Open the Run dialog (Meta+R), type a command, and press Enter.
+
+    Exists as a named operation because getting it right required discovering that the chord must
+    hold the modifier down, and that a previous session's text may still be in the field — a stale
+    `regedit` left there from an earlier interaction silently produced a command that did not
+    exist, with no error to explain why.
+    """
+    time.sleep(0.4)
+    chord(qmp, META, "r")
+    time.sleep(1.0)
+
+    if clear_first:
+        # Select all and delete, so an existing value cannot be appended to.
+        chord(qmp, CTRL, "a")
+        press(qmp, "delete")
+        time.sleep(0.2)
+
+    type_text(qmp, command)
+    time.sleep(0.4)
+    press(qmp, "ret")
 
 
 def move_pointer(qmp, x, y, absolute_size=(1024, 768)):
@@ -207,6 +316,26 @@ def main(argv):
                 return 2
             type_text(qmp, " ".join(args))
             print(f"typed {len(' '.join(args))} character(s)")
+            return 0
+
+        if command == "run":
+            # Open the Run dialog, type the command, press Enter. The chord handling and the
+            # field-clearing are the parts that took discovering.
+            if not args:
+                print("run needs a command", file=sys.stderr)
+                return 2
+            target = " ".join(args)
+            run_dialog(qmp, target)
+            print(f"ran: {target}")
+            return 0
+
+        if command == "chord":
+            # e.g. `chord ctrl alt delete`
+            if not args:
+                print("chord needs at least one key", file=sys.stderr)
+                return 2
+            chord(qmp, *args)
+            print(f"chord: {'+'.join(args)}")
             return 0
 
         if command in ("click", "move"):

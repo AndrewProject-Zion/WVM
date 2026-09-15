@@ -368,7 +368,21 @@ impl VmConfig {
             self.forward_port, self.guest_port
         ));
         a.push("-device".into());
-        a.push("virtio-net-pci,netdev=net0".into());
+        // e1000e, NOT virtio-net. This is deliberate and measured, not a preference.
+        //
+        // virtio-net is the faster NIC, but it needs the NetKVM driver from the virtio-win disc
+        // installed inside the guest. On a fresh Windows install that driver is absent, so the
+        // guest enumerates NO network adapter at all — `ipconfig` prints its header and nothing
+        // else. The failure is silent from the host side: QEMU has the device attached, the host
+        // forward is bound and listening, and the guest simply has no interface to route through.
+        // It presents as "the guest cannot reach the host", which points at the transport rather
+        // than at the missing driver.
+        //
+        // e1000e is supported by the Windows in-box driver set with no installation step, so the
+        // adapter appears on first boot. For a control channel over user-mode NAT the bandwidth
+        // difference is irrelevant, and a guest that reaches the network without manual driver
+        // surgery is worth considerably more than a faster NIC that does not.
+        a.push("e1000e,netdev=net0".into());
 
         // Headless by default (D-004). No display backend at all, so nothing depends on a
         // desktop session being present.
@@ -487,6 +501,39 @@ mod tests {
         assert!(
             joined.contains("-cpu host"),
             "the host CPU model is required"
+        );
+    }
+
+    #[test]
+    fn the_nic_works_without_a_guest_driver_install() {
+        // Regression guard with a specific failure behind it.
+        //
+        // This was virtio-net, which is faster but needs the NetKVM driver installing inside the
+        // guest before any adapter exists. On a fresh install the guest enumerated NO network
+        // interface, so it could not reach the host even though the host forward was bound and
+        // listening — the failure looked like a broken transport, not a missing driver.
+        //
+        // e1000e uses the Windows in-box driver. If someone changes this back to virtio-net for
+        // throughput, they are reintroducing a guest that boots with no network.
+        let joined = config().qemu_args().join(" ");
+        assert!(
+            joined.contains("e1000e,netdev=net0"),
+            "the NIC must be one Windows drives out of the box: {joined}"
+        );
+        assert!(
+            !joined.contains("virtio-net-pci"),
+            "virtio-net needs a guest driver install and leaves the guest with no adapter: {joined}"
+        );
+    }
+
+    #[test]
+    fn the_host_forward_binds_loopback_only() {
+        // The control channel is for this host, not the network. A forward on 0.0.0.0 would
+        // expose the guest's control port to the LAN.
+        let joined = config().qemu_args().join(" ");
+        assert!(
+            joined.contains("hostfwd=tcp:127.0.0.1:"),
+            "the forward must be bound to loopback: {joined}"
         );
     }
 
