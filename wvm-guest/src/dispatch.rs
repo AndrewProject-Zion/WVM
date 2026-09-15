@@ -165,15 +165,21 @@ pub fn handle(request: &Request) -> Response {
             direction,
             host_path,
             guest_path,
+            overwrite,
         } => {
-            // The guest-side transfer is real, and it is the side that enforces where bytes land.
+            // `overwrite` is consumed by the Windows arm only; on a host build the filesystem layer
+            // is absent and this binding would otherwise warn.
+            #[cfg(not(windows))]
+            let _ = overwrite;
+            // Open the destination NOW, before any bytes arrive.
             //
-            // This is deliberate: the path containment rules live here, so routing a transfer
-            // through the guest means the guest — not the caller — decides what it is willing to
-            // write and where. A host-side copy would be faster and would bypass exactly the
-            // boundary that exists to stop a transfer writing outside its staging root.
+            // This is where the guest decides whether it will write at all: the path is resolved and
+            // contained against the staging root, and an existing file is refused unless the caller
+            // asked to replace it. Doing it here rather than on the first chunk means a bad path or
+            // a refused overwrite costs one round trip, instead of failing partway through a file
+            // that may be gigabytes long.
             //
-            // See fsio.rs for why this is chunked rather than one frame per file.
+            // The bytes then arrive as `TransferChunk` requests, written through `chunk.rs`.
             let plan = match crate::fsio::plan_from(
                 direction,
                 &crate::fsio::roots(),
@@ -190,11 +196,12 @@ pub fn handle(request: &Request) -> Response {
 
             #[cfg(windows)]
             {
-                let io = crate::fsio::FilesystemIo::new();
-                match crate::transfer::execute(&io, &plan) {
-                    Ok(bytes) => Response::Ok {
+                match crate::chunk::begin(&plan.guest_path, *overwrite) {
+                    Ok(dest) => Response::Ok {
                         payload: Payload::Transferred {
-                            bytes,
+                            // Zero: this acknowledges the destination, not a transfer. The byte
+                            // count arrives with the chunks.
+                            bytes: dest.expected_bytes,
                             direction: plan.direction.to_string(),
                             guest_path: plan.guest_path.clone(),
                         },
@@ -212,6 +219,51 @@ pub fn handle(request: &Request) -> Response {
                     message: "transfer: the filesystem layer is only present in a Windows build \
                               of wvm-guest; this binary was built for the host, where it exists \
                               to be type-checked and tested rather than run"
+                        .to_string(),
+                }
+            }
+        }
+
+        Request::TransferChunk {
+            offset,
+            data_base64,
+            eof,
+        } => {
+            // Decode FIRST. A chunk whose base64 is malformed is refused before anything is written,
+            // so a corrupt frame cannot leave a partial write behind.
+            let data = match crate::base64::decode(data_base64) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("transfer chunk: {e}"),
+                    };
+                }
+            };
+
+            #[cfg(windows)]
+            {
+                match crate::chunk::write_chunk(*offset, &data, *eof, None) {
+                    Ok(total) => Response::Ok {
+                        payload: Payload::ChunkWritten {
+                            offset: *offset,
+                            bytes: data.len() as u64,
+                            total,
+                            eof: *eof,
+                        },
+                    },
+                    Err(e) => Response::Error {
+                        message: format!("transfer chunk: {e}"),
+                    },
+                }
+            }
+
+            #[cfg(not(windows))]
+            {
+                let _ = (offset, eof, data);
+                Response::Error {
+                    message: "transfer chunk: the filesystem layer is only present in a Windows \
+                              build of wvm-guest; this binary was built for the host, where it \
+                              exists to be type-checked and tested rather than run"
                         .to_string(),
                 }
             }
@@ -356,6 +408,7 @@ mod tests {
             direction: TransferDirection::HostToGuest,
             host_path: Some(format!(r"{}\file.bin", roots.host)),
             guest_path: format!(r"{}\file.bin", roots.guest),
+            overwrite: false,
         });
 
         match response {
@@ -480,6 +533,7 @@ mod tests {
             direction: TransferDirection::GuestToHost,
             host_path: None,
             guest_path: String::new(),
+            overwrite: false,
         };
         assert!(validate(&req).is_err());
     }

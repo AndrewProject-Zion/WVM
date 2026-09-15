@@ -17,14 +17,15 @@ mod image;
 mod input;
 mod journal;
 mod policy;
+mod push;
 mod server;
 mod supervisor;
 mod vm;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::time::Duration;
-use wvm_ipc::{Payload, Request, RequestKind, Response, Verb, PROTOCOL_VERSION};
+use wvm_ipc::{RequestKind, Verb, PROTOCOL_VERSION};
 
 /// Windows VM control plane for autonomous agents.
 #[derive(Debug, Parser)]
@@ -499,64 +500,38 @@ fn run_vm(action: VmAction) -> Result<()> {
                 );
             }
 
-            // The host sends both paths; the guest resolves them against its staging roots and
-            // refuses anything outside them. The boundary is enforced where the write happens,
-            // not where the request is made — a bug here cannot become a write anywhere else.
-            let direction = match action.as_str() {
-                "push" => wvm_ipc::TransferDirection::HostToGuest,
-                "pull" => wvm_ipc::TransferDirection::GuestToHost,
-                other => anyhow::bail!("unknown transfer action '{other}' (expected push or pull)"),
-            };
-
-            let request = Request::Transfer {
-                direction,
-                host_path: Some(source.to_string_lossy().to_string()),
-                guest_path: guest_path.clone(),
-            };
-
             let addr = format!("127.0.0.1:{}", config.forward_port);
-            let response = guestclient::request(&addr, &request)?;
 
-            match response {
-                Response::Ok {
-                    payload:
-                        Payload::Transferred {
-                            bytes,
-                            direction,
-                            guest_path,
-                        },
-                } => {
+            match action.as_str() {
+                "push" => {
+                    // Lockstep: read a chunk, send it, wait for the acknowledgement, repeat. See
+                    // `push.rs` for why the host must not stream ahead of the guest's disk.
+                    let started = std::time::Instant::now();
+                    let pushed = push::push(&addr, &source, &guest_path, overwrite)?;
+                    let elapsed = started.elapsed();
+
+                    println!(
+                        "pushed {} bytes in {} chunk(s) to {}",
+                        pushed.bytes, pushed.chunks, pushed.guest_path
+                    );
+                    println!(
+                        "  {:.1} ms total, {:.0} KiB/s effective",
+                        elapsed.as_secs_f64() * 1000.0,
+                        (pushed.bytes as f64 / 1024.0) / elapsed.as_secs_f64().max(0.001)
+                    );
                     if !overwrite {
-                        eprintln!("  (existing files at the destination are refused; pass --overwrite to replace)");
+                        println!("  (an existing file at the destination would have been refused)");
                     }
-                    println!("transferred {bytes} bytes ({direction}) to {guest_path}");
-
-                    // Verify rather than trust. For a pull, the guest's byte count is a claim about
-                    // its own write; checking the local file is what turns that into a fact.
-                    if matches!(direction.as_str(), "guest_to_host") {
-                        let wrote = std::fs::metadata(&source)
-                            .with_context(|| format!("confirming {}", source.display()))?
-                            .len();
-                        if wrote != bytes {
-                            anyhow::bail!(
-                                "the guest reported {bytes} bytes but {} is {wrote} bytes",
-                                source.display()
-                            );
-                        }
-                    }
+                    Ok(())
                 }
-                Response::Ok { payload } => println!("unexpected payload: {payload:?}"),
-                // A handshake reply means the guest answered a Transfer with a greeting, which
-                // would be a protocol bug rather than a transfer failure. Reported as such instead
-                // of falling through to a catch-all that would hide it.
-                Response::Ready { .. } => {
-                    anyhow::bail!(
-                        "the guest answered the transfer with a handshake; protocol mismatch"
-                    )
-                }
-                Response::Error { message } => anyhow::bail!("{message}"),
+                "pull" => anyhow::bail!(
+                    "pull is not implemented yet: a push needs the host to be the READER, and a pull \
+                     needs the host to be the WRITER. The carrier is proven and the chunk framing is \
+                     shared, so this is the same loop with the roles swapped — but it is not \
+                     written, and pretending otherwise would be worse than saying so."
+                ),
+                other => anyhow::bail!("unknown transfer action '{other}' (expected push or pull)"),
             }
-            Ok(())
         }
 
         VmAction::Capture { out, expect, .. } => {

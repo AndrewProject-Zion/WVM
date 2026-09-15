@@ -263,6 +263,10 @@ impl Server {
                 direction,
                 host_path,
                 guest_path,
+                // Not part of the policy decision: whether an existing file may be replaced is the
+                // GUEST's call, made where the write happens. The host cannot see the guest's
+                // filesystem, so a check here would be about a string rather than about a file.
+                overwrite: _,
             } => {
                 // Both ends must be inside their roots; checking only one would leave the other
                 // as an unguarded path.
@@ -270,6 +274,14 @@ impl Server {
                     policy::check_host_transfer(grant, *direction, Path::new(hp))?;
                 }
                 policy::check_guest_path(grant, guest_path)
+            }
+            Request::TransferChunk { .. } => {
+                // A chunk carries no path. The destination was named and checked by the opening
+                // `Transfer`, and this writes only where that established. Authorising it by verb
+                // alone is therefore correct rather than a shortcut: there is no path here to check,
+                // and inventing one would be enforcing a rule against data that does not exist.
+                // Whether a transfer is actually open is the guest's business, not the policy layer's.
+                Ok(())
             }
             // Inspect, Capture, Input and Lifecycle are authorised by the verb grant alone in M2.
             // Finer scoping (which monitors, which key ranges) belongs with the guest layer.
@@ -315,6 +327,7 @@ impl Server {
             Request::Capture { .. } => no_guest("capture"),
             Request::Input { .. } => no_guest("input"),
             Request::Transfer { .. } => no_guest("transfer"),
+            Request::TransferChunk { .. } => no_guest("transfer chunk"),
             Request::Lifecycle { .. } => no_guest("lifecycle"),
         }
     }
@@ -342,6 +355,7 @@ fn op_name(request: &Request) -> &'static str {
         Request::Exec { .. } => "exec",
         Request::Capture { .. } => "capture",
         Request::Input { .. } => "input",
+        Request::TransferChunk { .. } => "transfer_chunk",
         Request::Transfer { .. } => "transfer",
         Request::Lifecycle { .. } => "lifecycle",
     }
@@ -362,6 +376,7 @@ fn payload_name(payload: &Payload) -> &'static str {
         Payload::ProcessExited(_) => "process_exited",
         Payload::ProcessOutput { .. } => "process_output",
         Payload::Frame { .. } => "frame",
+        Payload::ChunkWritten { .. } => "chunk_written",
         Payload::Transferred { .. } => "transferred",
         Payload::LifecycleDone { .. } => "lifecycle_done",
     }
@@ -613,6 +628,7 @@ mod tests {
                 direction: TransferDirection::HostToGuest,
                 host_path: Some("/etc/shadow".into()),
                 guest_path: "C:\\wvm\\x".into(),
+                overwrite: false,
             },
         );
         match response {
@@ -633,6 +649,7 @@ mod tests {
                 direction: TransferDirection::HostToGuest,
                 host_path: Some("/tmp/wvm-out/file.bin".into()),
                 guest_path: "C:\\wvm\\file.bin".into(),
+                overwrite: false,
             },
         );
         match response {
@@ -656,6 +673,7 @@ mod tests {
                 direction: TransferDirection::HostToGuest,
                 host_path: Some("/tmp/wvm-out/x".into()),
                 guest_path: "C:\\wvm\\..\\Windows\\System32\\config\\SAM".into(),
+                overwrite: false,
             },
         );
         match response {

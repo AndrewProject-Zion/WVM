@@ -139,6 +139,50 @@ pub enum Request {
         host_path: Option<String>,
         /// Path in the guest, relative to the grant's `guest_root`.
         guest_path: String,
+        /// Whether an existing file at the destination may be replaced.
+        ///
+        /// Defaults, at the caller, to false. A transfer that silently overwrites is a data-loss bug
+        /// waiting for a caller that retried — and the refusal must happen BEFORE the destination is
+        /// opened, or a rejected transfer leaves a truncated file behind.
+        #[serde(default)]
+        overwrite: bool,
+    },
+
+    /// One chunk of a transfer's bytes, plus the framing needed to reassemble them.
+    ///
+    /// # Why this is a separate verb from `Transfer`
+    ///
+    /// `Transfer` names WHAT is being moved. This carries the bytes. Keeping them apart means the
+    /// guest can validate and open the destination once, on `Transfer`, and then write chunk after
+    /// chunk without re-resolving a path it has already checked.
+    ///
+    /// # Why the offset is sent rather than assumed
+    ///
+    /// The obvious design is to treat chunks as a stream and append in arrival order, with the host
+    /// trusting the transport to preserve order. TCP does preserve order — within one connection.
+    /// But a transfer that spans a reconnect, or a host that retries a chunk whose acknowledgement
+    /// it did not see, would silently corrupt the file with the append-only shape, and the
+    /// corruption would be undetectable until the hash was compared.
+    ///
+    /// Sending the offset makes every chunk self-describing: the guest can refuse a chunk that does
+    /// not land where it expected, which turns a silent corruption into a loud error.
+    TransferChunk {
+        /// Byte offset this chunk begins at.
+        offset: u64,
+        /// The chunk's bytes, base64-encoded because JSON strings cannot carry arbitrary binary.
+        ///
+        /// The cost is a 33% larger payload. At 256 KiB per chunk that is about 341 KiB on the wire,
+        /// measured working as a single frame (`wvm-ipc`'s `a_transfer_sized_frame_round_trips`).
+        /// The alternative — multiplexed binary frames — would need a length-prefix-plus-type-header
+        /// parser in Rust twice and in the Python client once, and three implementations of a
+        /// framing rule is where desync bugs live.
+        data_base64: String,
+        /// True on the last chunk, so the guest knows to check the total and close the file.
+        ///
+        /// The length is not sent in advance deliberately: a sender that declares a size and then
+        /// dies leaves the receiver unable to distinguish "complete" from "truncated" without a
+        /// timeout. An explicit end marker cannot be ambiguous.
+        eof: bool,
     },
 
     /// VM lifecycle. Exercises [`Verb::Lifecycle`].
@@ -227,7 +271,7 @@ impl Request {
             Request::Exec { .. } => Verb::Exec,
             Request::Capture { .. } => Verb::Capture,
             Request::Input { .. } => Verb::Input,
-            Request::Transfer { .. } => Verb::Transfer,
+            Request::Transfer { .. } | Request::TransferChunk { .. } => Verb::Transfer,
             Request::Lifecycle { .. } => Verb::Lifecycle,
         }
     }
@@ -257,6 +301,8 @@ pub enum RequestKind {
         direction: TransferDirection,
         host_path: Option<String>,
         guest_path: String,
+        /// Whether an existing destination may be replaced.
+        overwrite: bool,
     },
     Lifecycle {
         action: LifecycleAction,
@@ -299,10 +345,12 @@ impl RequestKind {
                 direction,
                 host_path,
                 guest_path,
+                overwrite,
             } => Request::Transfer {
                 direction,
                 host_path,
                 guest_path,
+                overwrite,
             },
             RequestKind::Lifecycle { action } => Request::Lifecycle { action },
         }
@@ -418,6 +466,23 @@ pub enum Payload {
         direction: String,
         /// Where the bytes were written, as the guest resolved it.
         guest_path: String,
+    },
+    /// Acknowledgement of one transfer chunk.
+    ///
+    /// This is what closes the lockstep loop: the host will not send the next chunk until it sees
+    /// this, so the transfer advances at the speed of the guest's disk rather than the host's.
+    ///
+    /// It carries the running total so the host can detect a lost or short write on the chunk it
+    /// just sent, instead of discovering it from a hash mismatch at the end of a 10 GB file.
+    ChunkWritten {
+        /// Echoed, so a reply can be matched to the chunk that caused it.
+        offset: u64,
+        /// Bytes in this chunk.
+        bytes: u64,
+        /// Total bytes written to the destination so far.
+        total: u64,
+        /// Echoed end-of-file flag.
+        eof: bool,
     },
     /// Lifecycle acknowledgement.
     LifecycleDone {
@@ -548,6 +613,7 @@ mod tests {
                 direction: TransferDirection::HostToGuest,
                 host_path: None,
                 guest_path: "x".into(),
+                overwrite: false,
             },
             RequestKind::Lifecycle {
                 action: LifecycleAction::Suspend,

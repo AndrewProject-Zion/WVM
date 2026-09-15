@@ -15,6 +15,7 @@
 
 mod base64;
 mod capture;
+mod chunk;
 mod dispatch;
 mod fsio;
 mod log;
