@@ -33,6 +33,17 @@ pub enum Direction {
     GuestToHost,
 }
 
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The wire spelling, matching the serde rename, so the payload's `direction` field is the
+        // same string the request used. A caller comparing them should not have to translate.
+        match self {
+            Direction::HostToGuest => write!(f, "host_to_guest"),
+            Direction::GuestToHost => write!(f, "guest_to_host"),
+        }
+    }
+}
+
 /// What the guest was asked to do, after planning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferPlan {

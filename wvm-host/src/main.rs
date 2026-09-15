@@ -12,6 +12,7 @@
 //! not already granted.
 
 mod doctor;
+mod guestclient;
 mod image;
 mod input;
 mod journal;
@@ -20,10 +21,10 @@ mod server;
 mod supervisor;
 mod vm;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::time::Duration;
-use wvm_ipc::{RequestKind, Verb, PROTOCOL_VERSION};
+use wvm_ipc::{Payload, Request, RequestKind, Response, Verb, PROTOCOL_VERSION};
 
 /// Windows VM control plane for autonomous agents.
 #[derive(Debug, Parser)]
@@ -147,6 +148,32 @@ enum VmAction {
 
         #[arg(long, default_value_t = 40)]
         lines: usize,
+    },
+
+    /// Move a file between the host and the guest.
+    ///
+    /// Both paths must be inside the guest's staging roots. The guest checks that, not the host —
+    /// which is the point of the staging design: the side that writes decides where writes may land.
+    Transfer {
+        #[arg(long, default_value = "wvm.toml", global = true)]
+        config: std::path::PathBuf,
+
+        /// `push` (host to guest) or `pull` (guest to host).
+        #[arg(value_parser = ["push", "pull"])]
+        action: String,
+
+        /// The file to move.
+        source: std::path::PathBuf,
+
+        /// Where to put it, inside the guest's staging root.
+        guest_path: String,
+
+        /// Replace an existing file at the destination.
+        ///
+        /// Off by default: a transfer that silently overwrites is a data-loss bug waiting for a
+        /// caller that retried.
+        #[arg(long)]
+        overwrite: bool,
     },
 
     /// Capture the guest's screen as a PNG.
@@ -326,6 +353,7 @@ fn run_vm(action: VmAction) -> Result<()> {
         | VmAction::Suspend { config }
         | VmAction::Shutdown { config, .. }
         | VmAction::Log { config, .. }
+        | VmAction::Transfer { config, .. }
         | VmAction::Capture { config, .. }
         | VmAction::Input { config, .. } => config.clone(),
     };
@@ -452,6 +480,82 @@ fn run_vm(action: VmAction) -> Result<()> {
 
         VmAction::Log { lines, .. } => {
             println!("{}", supervisor.serial_tail(lines)?);
+            Ok(())
+        }
+
+        VmAction::Transfer {
+            action,
+            source,
+            guest_path,
+            overwrite,
+            ..
+        } => {
+            let config = supervisor.config();
+
+            if !supervisor.state().is_running() {
+                anyhow::bail!(
+                    "the VM is not running, so there is nothing to transfer to. \
+                     Start it with `wvm vm start`"
+                );
+            }
+
+            // The host sends both paths; the guest resolves them against its staging roots and
+            // refuses anything outside them. The boundary is enforced where the write happens,
+            // not where the request is made — a bug here cannot become a write anywhere else.
+            let direction = match action.as_str() {
+                "push" => wvm_ipc::TransferDirection::HostToGuest,
+                "pull" => wvm_ipc::TransferDirection::GuestToHost,
+                other => anyhow::bail!("unknown transfer action '{other}' (expected push or pull)"),
+            };
+
+            let request = Request::Transfer {
+                direction,
+                host_path: Some(source.to_string_lossy().to_string()),
+                guest_path: guest_path.clone(),
+            };
+
+            let addr = format!("127.0.0.1:{}", config.forward_port);
+            let response = guestclient::request(&addr, &request)?;
+
+            match response {
+                Response::Ok {
+                    payload:
+                        Payload::Transferred {
+                            bytes,
+                            direction,
+                            guest_path,
+                        },
+                } => {
+                    if !overwrite {
+                        eprintln!("  (existing files at the destination are refused; pass --overwrite to replace)");
+                    }
+                    println!("transferred {bytes} bytes ({direction}) to {guest_path}");
+
+                    // Verify rather than trust. For a pull, the guest's byte count is a claim about
+                    // its own write; checking the local file is what turns that into a fact.
+                    if matches!(direction.as_str(), "guest_to_host") {
+                        let wrote = std::fs::metadata(&source)
+                            .with_context(|| format!("confirming {}", source.display()))?
+                            .len();
+                        if wrote != bytes {
+                            anyhow::bail!(
+                                "the guest reported {bytes} bytes but {} is {wrote} bytes",
+                                source.display()
+                            );
+                        }
+                    }
+                }
+                Response::Ok { payload } => println!("unexpected payload: {payload:?}"),
+                // A handshake reply means the guest answered a Transfer with a greeting, which
+                // would be a protocol bug rather than a transfer failure. Reported as such instead
+                // of falling through to a catch-all that would hide it.
+                Response::Ready { .. } => {
+                    anyhow::bail!(
+                        "the guest answered the transfer with a handshake; protocol mismatch"
+                    )
+                }
+                Response::Error { message } => anyhow::bail!("{message}"),
+            }
             Ok(())
         }
 

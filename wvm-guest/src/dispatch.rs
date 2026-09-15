@@ -151,7 +151,63 @@ pub fn handle(request: &Request) -> Response {
         }
 
         Request::Input { .. } => not_yet("input"),
-        Request::Transfer { .. } => not_yet("transfer"),
+
+        Request::Transfer {
+            direction,
+            host_path,
+            guest_path,
+        } => {
+            // The guest-side transfer is real, and it is the side that enforces where bytes land.
+            //
+            // This is deliberate: the path containment rules live here, so routing a transfer
+            // through the guest means the guest — not the caller — decides what it is willing to
+            // write and where. A host-side copy would be faster and would bypass exactly the
+            // boundary that exists to stop a transfer writing outside its staging root.
+            //
+            // See fsio.rs for why this is chunked rather than one frame per file.
+            let plan = match crate::fsio::plan_from(
+                direction,
+                &crate::fsio::roots(),
+                guest_path,
+                host_path.as_deref().unwrap_or(""),
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Response::Error {
+                        message: format!("transfer: {e}"),
+                    };
+                }
+            };
+
+            #[cfg(windows)]
+            {
+                let io = crate::fsio::FilesystemIo::new();
+                match crate::transfer::execute(&io, &plan) {
+                    Ok(bytes) => Response::Ok {
+                        payload: Payload::Transferred {
+                            bytes,
+                            direction: plan.direction.to_string(),
+                            guest_path: plan.guest_path.clone(),
+                        },
+                    },
+                    Err(e) => Response::Error {
+                        message: format!("transfer: {e}"),
+                    },
+                }
+            }
+
+            #[cfg(not(windows))]
+            {
+                let _ = plan;
+                Response::Error {
+                    message: "transfer: the filesystem layer is only present in a Windows build \
+                              of wvm-guest; this binary was built for the host, where it exists \
+                              to be type-checked and tested rather than run"
+                        .to_string(),
+                }
+            }
+        }
+
         Request::Lifecycle { .. } => not_yet("lifecycle"),
     }
 }
@@ -235,20 +291,94 @@ mod tests {
     }
 
     #[test]
+    fn transfer_refuses_a_path_outside_the_staging_root() {
+        // The property that matters most about transfer: the guest decides where bytes may land,
+        // and refuses everything else. A transfer to an arbitrary path would be the host-`/`-as-`Z:`
+        // mistake this project exists to avoid.
+        //
+        // Traversal is the specific case, because it is the one a naive `starts_with` check passes.
+        let roots = crate::fsio::Roots::default_staging();
+
+        for escaped in [
+            "../../Windows/System32/drivers/etc/hosts",
+            r"C:\Windows\System32\config\SAM",
+            r"..\..\..\Windows\win.ini",
+        ] {
+            let planned = crate::fsio::plan_from(
+                &TransferDirection::HostToGuest,
+                &roots,
+                escaped,
+                "C:/staging/source.bin",
+            );
+            assert!(
+                planned.is_err(),
+                "'{escaped}' must be refused, not resolved into the staging root"
+            );
+        }
+
+        // And a path INSIDE the root is accepted, so the check is not simply refusing everything —
+        // a boundary that refuses all input is not a boundary, it is a wall, and it would pass the
+        // loop above while making transfer useless.
+        let ok = crate::fsio::plan_from(
+            &TransferDirection::HostToGuest,
+            &roots,
+            r"C:\ProgramData\wvm\staging\payload.bin",
+            r"C:\ProgramData\wvm\staging-host\payload.bin",
+        );
+        assert!(
+            ok.is_ok(),
+            "a path inside the staging root must be allowed: {ok:?}"
+        );
+    }
+
+    #[test]
+    fn transfer_on_a_host_build_refuses_rather_than_pretending() {
+        // The filesystem layer is Windows-only. On a host build the honest answer is that the
+        // platform half is absent — not an Ok with a fabricated byte count, and not the
+        // "not implemented" stub message, which would imply the verb is unwritten.
+        //
+        // Both paths must be INSIDE the staging roots here, or the containment check refuses the
+        // request first and this test never reaches the platform branch it is about. (The first
+        // version of this test used an arbitrary host path and asserted the wrong thing failed —
+        // which is itself evidence the containment check runs before anything else.)
+        let roots = crate::fsio::Roots::default_staging();
+
+        let response = handle(&Request::Transfer {
+            direction: TransferDirection::HostToGuest,
+            host_path: Some(format!(r"{}\file.bin", roots.host)),
+            guest_path: format!(r"{}\file.bin", roots.guest),
+        });
+
+        match response {
+            Response::Error { message } => {
+                if cfg!(windows) {
+                    // On Windows the transfer may genuinely succeed or fail on the filesystem; this
+                    // test is about the host build's honesty, so assert only that we did not panic.
+                    return;
+                }
+                assert!(
+                    message.contains("Windows build"),
+                    "a host build must name the missing platform, said: {message}"
+                );
+                assert!(
+                    !message.contains("not implemented"),
+                    "transfer is implemented; the message must not claim otherwise"
+                );
+            }
+            other => panic!("a host build must refuse, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unimplemented_operations_report_honestly() {
         // The critical property: a stub must never look like a success.
         //
-        // `exec` and `capture` are no longer here — both have real implementations. On a host
-        // build their platform halves cannot run, and each reports that explicitly rather than
-        // claiming to be unwritten; see the tests below.
+        // `exec`, `capture` and `transfer` are no longer here — all three have real
+        // implementations. On a host build their platform halves cannot run, and each reports that
+        // explicitly rather than claiming to be unwritten; see the tests below.
         let cases = vec![
             Request::Input {
                 event: InputEvent::MouseMove { x: 0, y: 0 },
-            },
-            Request::Transfer {
-                direction: TransferDirection::HostToGuest,
-                host_path: None,
-                guest_path: "x".into(),
             },
             Request::Lifecycle {
                 action: LifecycleAction::Suspend,

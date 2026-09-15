@@ -16,6 +16,7 @@
 mod base64;
 mod capture;
 mod dispatch;
+mod fsio;
 mod paths;
 mod transfer;
 mod transport;

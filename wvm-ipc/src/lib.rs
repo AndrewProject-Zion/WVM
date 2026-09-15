@@ -407,8 +407,17 @@ pub enum Payload {
         height: u32,
     },
     /// Bytes moved by a transfer.
+    ///
+    /// Carries the direction and the destination as well as the count, so a caller can verify which
+    /// transfer completed rather than only that one did. "The request succeeded" and "the file I
+    /// asked about arrived complete" are different claims, and a control channel that conflates
+    /// them is how a truncated file ends up looking like a good one.
     Transferred {
         bytes: u64,
+        /// `host_to_guest` or `guest_to_host`, echoing the request.
+        direction: String,
+        /// Where the bytes were written, as the guest resolved it.
+        guest_path: String,
     },
     /// Lifecycle acknowledgement.
     LifecycleDone {
