@@ -204,6 +204,25 @@ pub fn run(
         .spawn()
         .map_err(|e| anyhow!("could not start '{program}': {e}"))?;
 
+    // Drain both pipes on their own threads, starting NOW, before we wait for the process.
+    //
+    // This was WVM-01, and it was a correctness bug rather than a limit. The original code waited
+    // for the process to exit and only then read its output. But a pipe holds only about 64 KiB on
+    // Windows: once the process filled that buffer its next write BLOCKED, so the process could
+    // never exit, so `try_wait` never reported it finished. The deadline eventually fired — not
+    // because the command was slow, but because we had wedged it ourselves. `cmd /c dir /s C:\`
+    // returned `timed_out` in place of the listing it had already produced.
+    //
+    // Reporting a healthy command as timed out is the worst kind of failure for a control channel:
+    // the caller cannot tell it from a genuinely hung command, and the output that proves otherwise
+    // is discarded. So the pipes are drained concurrently and the deadline means what it says.
+    //
+    // Threads rather than non-blocking reads because the read must not stop until EOF, and a
+    // non-blocking loop would have to poll two pipes while also polling the child. Both joined
+    // below, so no read outlives this function.
+    let stdout_reader = spawn_pipe_reader(child.stdout.take());
+    let stderr_reader = spawn_pipe_reader(child.stderr.take());
+
     // Poll rather than blocking on `wait()`. A blocking wait cannot honour a deadline, and the
     // alternative — a thread and a channel — is more machinery than this needs.
     let deadline = Duration::from_millis(timeout_ms);
@@ -238,14 +257,10 @@ pub fn run(
         }
     }
 
-    // Read the pipes only after the process has finished or been killed. Reading concurrently
-    // would need threads; because this service handles one request at a time this is safe, with
-    // the one caveat that a program emitting more than a pipe buffer's worth (64 KiB) before
-    // exiting could deadlock against a full pipe. That limit is acceptable for a control channel
-    // whose output is diagnostics, and is recorded here rather than left as a surprise: if a
-    // caller ever needs to stream large output, this is the line that changes.
-    let stdout = read_pipe(child.stdout.take());
-    let stderr = read_pipe(child.stderr.take());
+    // Joined, not merely dropped: the readers must finish before their buffers can be read, and a
+    // detached thread would still be holding the pipe handle when the child is reaped below.
+    let stdout = join_pipe_reader(stdout_reader);
+    let stderr = join_pipe_reader(stderr_reader);
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
     let _ = &mut outcome;
@@ -256,6 +271,29 @@ pub fn run(
         stderr,
         elapsed_ms,
     })
+}
+
+/// Start draining a pipe on its own thread, if there is one.
+///
+/// `None` for a pipe that was not captured, which is a legitimate state rather than an error: the
+/// caller may not have asked for output.
+pub fn spawn_pipe_reader<R>(pipe: Option<R>) -> Option<std::thread::JoinHandle<String>>
+where
+    R: std::io::Read + Send + 'static,
+{
+    pipe.map(|p| std::thread::spawn(move || read_pipe(Some(p))))
+}
+
+/// Wait for a reader thread and take its buffer.
+///
+/// A panicked reader yields empty text rather than propagating. That loses output, which is bad,
+/// but it does not lose the *process result*, which is worse — and a reader thread cannot fail for
+/// any reason that makes the exit code untrustworthy.
+pub fn join_pipe_reader(handle: Option<std::thread::JoinHandle<String>>) -> String {
+    match handle {
+        Some(h) => h.join().unwrap_or_default(),
+        None => String::new(),
+    }
 }
 
 /// Read a captured pipe to completion, decoding lossily.
@@ -367,6 +405,65 @@ mod tests {
                 "the error should explain itself: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn a_pipe_larger_than_the_pipe_buffer_is_drained_concurrently() {
+        // WVM-01. The bug: `run` waited for the process to exit and only then read the pipes. A
+        // Windows pipe holds about 64 KiB, so a process emitting more than that blocked on its
+        // next write, never exited, and was reported as `timed_out` — with its already-produced
+        // output discarded. A healthy command reported as hung is indistinguishable from a real
+        // hang, which makes it a correctness bug rather than a limit.
+        //
+        // The property that fixes it: the reader must be able to consume output WHILE the writer
+        // is still producing it, which is the entire mechanism. 64 KiB is the pipe-buffer threshold
+        // on Windows; the payload below is sized just past it rather than far past it.
+        use std::io::Write;
+
+        // Sized just past the boundary the bug was about, not far past it.
+        //
+        // The first version of this test used 4 MiB "to clear the boundary with margin". Measuring
+        // the primitives (scripts/measure-pipe-throughput.py) showed 4 MiB moves in about 3ms, so
+        // the margin bought nothing and only made the test slow. What the test must exercise is a
+        // writer that outruns the pipe buffer — 256 KiB is 4x a 64 KiB buffer, which is the
+        // property, and it does it in microseconds.
+        const CHUNK: usize = 64 * 1024;
+        const CHUNKS: usize = 4;
+        const TOTAL: usize = CHUNK * CHUNKS;
+
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+
+        let finisher = std::thread::spawn(move || {
+            for _ in 0..CHUNKS {
+                writer.write_all(&vec![b'x'; CHUNK]).expect("write");
+            }
+            // Dropping the writer closes it, which is what lets the reader reach EOF. Without this
+            // the reader blocks forever — the same deadlock, from the other direction.
+        });
+
+        let handle = spawn_pipe_reader(Some(reader));
+        let drained = join_pipe_reader(handle);
+        finisher.join().expect("writer thread");
+
+        assert_eq!(
+            drained.len(),
+            TOTAL,
+            "every byte written must be drained, not just the first pipe buffer's worth"
+        );
+        assert!(
+            drained.bytes().all(|b| b == b'x'),
+            "the drained content is intact"
+        );
+    }
+
+    #[test]
+    fn a_missing_pipe_yields_no_reader_rather_than_erroring() {
+        // `None` is a legitimate state: the caller may not have asked for that stream. It must not
+        // be conflated with "the reader failed", or a command with no stderr would look broken.
+        assert_eq!(
+            join_pipe_reader(spawn_pipe_reader::<std::io::Empty>(None)),
+            ""
+        );
     }
 
     #[test]
