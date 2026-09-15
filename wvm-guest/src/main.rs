@@ -13,6 +13,8 @@
 //! `NotImplemented` responses rather than optimistic ones — a stub that pretends to work is
 //! worse than a stub that says it does not.
 
+mod base64;
+mod capture;
 mod dispatch;
 mod paths;
 mod transfer;
@@ -39,9 +41,15 @@ fn main() -> Result<()> {
     // Console mode. Kept deliberately: running the binary by hand and reading its output is what
     // makes a service install diagnosable.
     let addr = parse_bind(&args).unwrap_or_else(transport::default_bind);
-    serve_loop(&addr, move |port| {
-        eprintln!("wvm-guest: listening on {port}");
-    })
+    serve_loop(
+        &addr,
+        move |port| {
+            eprintln!("wvm-guest: listening on {port}");
+        },
+        // Console mode runs until interrupted. Ctrl+C terminates the process directly, so there is
+        // nothing to poll for.
+        || false,
+    )
 }
 
 /// Bind, accept, and serve, until the process is asked to stop.
@@ -49,25 +57,52 @@ fn main() -> Result<()> {
 /// Shared by console mode and the Windows service, so there is one implementation of the actual
 /// behaviour rather than two that drift. `on_ready` is called once the socket is bound, which is
 /// where console mode prints and where a service would report its state.
-pub fn serve_loop<F>(addr: &str, on_ready: F) -> Result<()>
+///
+/// # Stopping
+///
+/// The obvious loop — `for stream in listener.incoming()` — blocks indefinitely in `accept`, which
+/// means a stop request is never noticed. That was not a theoretical problem: `sc.exe stop` would
+/// report the service still RUNNING, the process would keep the binary open, and the next deploy
+/// failed with "the process cannot access the file because it is being used by another process".
+///
+/// So the listener is non-blocking and the loop polls. `should_stop` is consulted between attempts,
+/// which bounds how long a stop takes to roughly the poll interval rather than never.
+pub fn serve_loop<F, S>(addr: &str, on_ready: F, should_stop: S) -> Result<()>
 where
     F: FnOnce(&str),
+    S: Fn() -> bool,
 {
     let listener = transport::listen(addr)?;
+    // Non-blocking so the loop can check for a stop between connection attempts.
+    listener.set_nonblocking(true)?;
     on_ready(addr);
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(conn) => {
+    /// How long to wait between polls.
+    ///
+    /// Short enough that a stop feels immediate to a human, long enough not to spin a core. 100ms
+    /// costs nothing while idle and makes a stop take at most a tenth of a second longer than it
+    /// otherwise would.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+    loop {
+        if should_stop() {
+            return Ok(());
+        }
+
+        match listener.accept() {
+            Ok(Some(conn)) => {
                 if let Err(e) = dispatch::serve(conn) {
                     eprintln!("wvm-guest: connection ended: {e}");
                 }
             }
-            Err(e) => eprintln!("wvm-guest: accept failed: {e}"),
+            // Nothing pending: normal for a non-blocking listener.
+            Ok(None) => std::thread::sleep(POLL),
+            Err(e) => {
+                eprintln!("wvm-guest: accept failed: {e}");
+                std::thread::sleep(POLL);
+            }
         }
     }
-
-    Ok(())
 }
 
 /// Parse `--bind <addr>` without pulling in a full argument parser: the guest binary should stay

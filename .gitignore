@@ -11,3 +11,7 @@ vm_password.txt
 # The guest binary is built, not tracked. It is served to the guest over HTTP for install;
 # committing a 500 KB executable that goes stale on every build is how a repo fills up.
 /scripts/wvm-guest.exe
+
+# Python bytecode. Generated, not source.
+__pycache__/
+*.pyc

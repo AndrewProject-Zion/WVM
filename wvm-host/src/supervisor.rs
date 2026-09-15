@@ -100,6 +100,60 @@ impl Qmp {
             // Anything else is an event; ignore it here.
         }
     }
+
+    /// Capture the guest's framebuffer, returning a PPM.
+    ///
+    /// QMP's `screendump` writes to a path rather than returning data, so this takes a destination
+    /// and the caller reads it back.
+    ///
+    /// # Why the host captures rather than the guest
+    ///
+    /// The obvious design is for the guest service to screenshot itself, keeping every operation
+    /// behind the grant check and the journal. That was the original plan and it cannot work: a
+    /// Windows service runs in **session 0**, which has no interactive desktop, and `BitBlt` fails
+    /// there because there is no screen to copy from. Verified on this guest —
+    /// `query session` reports `services` at ID 0 and the logged-in user's `console` at ID 1.
+    /// Session 0 isolation has been in Windows since Vista specifically to stop services touching
+    /// the desktop, so this is the OS working as designed, not a bug to code around.
+    ///
+    /// Capturing on the host loses the guest as the actor, but keeps what actually mattered about
+    /// running it in-guest: the operation still goes through the capability grant and the journal.
+    /// The alternative — spawning a helper in session 1 via `WTSQueryUserToken` and
+    /// `CreateProcessAsUser` — needs `SeTcbPrivilege` and per-request process creation, and is worth
+    /// it only if the guest is not trusted to report truthfully about its own screen.
+    ///
+    /// `format` names the QMP format; omitting it lets QEMU choose, which is PPM on this build.
+    pub fn screendump(&mut self, destination: &Path, format: Option<&str>) -> Result<()> {
+        let mut args = json!({ "filename": destination.to_string_lossy() });
+        if let Some(f) = format {
+            args["format"] = json!(f);
+        }
+
+        // `screendump` is asynchronous when a format is given: it returns before the file is
+        // written, so a caller reading immediately can see a partial image. Waiting on the
+        // resulting event is the honest fix; the alternative is a sleep, which is a guess.
+        self.execute("screendump", Some(args))?;
+
+        if format.is_some() {
+            self.wait_for_event("SCREENSHOT_COMPLETED", Duration::from_secs(30))?;
+        }
+
+        Ok(())
+    }
+
+    /// Block until an event with the given name arrives, or the timeout expires.
+    fn wait_for_event(&mut self, name: &str, timeout: Duration) -> Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            let message = self.read_message()?;
+            if let Some(event) = message.get("event") {
+                if event.as_str() == Some(name) {
+                    return Ok(());
+                }
+            }
+        }
+        bail!("timed out waiting for the QMP event '{name}'")
+    }
 }
 
 /// Current state of a VM, as observed rather than assumed.
@@ -144,15 +198,19 @@ impl Supervisor {
 
     /// Determine the current state without changing anything.
     pub fn state(&self) -> VmState {
+        // Prefer the pid file, which `wvm vm start` writes. Fall back to scanning for a QEMU
+        // process belonging to this VM, because a VM started any other way — by
+        // `scripts/vm-with-display.py`, or by hand — is running with no pid file at all.
+        //
+        // The fallback matters: deciding "stopped" from a missing file reported a live VM as
+        // stopped, and `wvm vm capture` then refused to capture something that was plainly running.
         let pid = match self.read_pid() {
-            Some(p) => p,
-            None => return VmState::Stopped,
+            Some(p) if process_is_alive(p) => p,
+            _ => match self.find_running_pid() {
+                Some(p) => p,
+                None => return VmState::Stopped,
+            },
         };
-
-        if !process_is_alive(pid) {
-            // The file outlived the process. Report Stopped rather than trusting the file.
-            return VmState::Stopped;
-        }
 
         match Qmp::connect(&self.config.qmp_socket()) {
             Ok(mut qmp) => match qmp.execute("query-status", None) {
@@ -173,6 +231,64 @@ impl Supervisor {
     fn read_pid(&self) -> Option<i32> {
         let text = std::fs::read_to_string(self.config.pid_file()).ok()?;
         text.trim().parse::<i32>().ok()
+    }
+
+    /// Find a QEMU process for this VM by scanning the process table.
+    ///
+    /// The pid file is only written by `wvm vm start`, so a VM launched another way — by
+    /// `scripts/vm-with-display.py`, or by hand — is running while the pid file is absent. Deciding
+    /// "stopped" from a missing file was wrong in exactly that case: a live VM with a working QMP
+    /// socket was reported stopped, and `wvm vm capture` refused to capture it.
+    ///
+    /// Matching is on the QEMU process name AND the VM's own name in its command line, so a second
+    /// VM on the host cannot be mistaken for this one. `pgrep -f` is avoided deliberately: it
+    /// matches the invoking shell's own command line, which has bitten this project before.
+    pub fn find_running_pid(&self) -> Option<i32> {
+        let entries = std::fs::read_dir("/proc").ok()?;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let Ok(pid) = name.parse::<i32>() else {
+                continue;
+            };
+
+            // Only consider processes whose executable is QEMU.
+            let comm = std::fs::read_to_string(path.join("comm")).unwrap_or_default();
+            if !comm.trim().starts_with("qemu-system") {
+                continue;
+            }
+
+            // And whose command line names this VM, so another VM is not returned instead.
+            //
+            // `/proc/<pid>/cmdline` is NUL-separated, not space-separated. Reading it as a string
+            // and searching for "-name w11" therefore never matches: the bytes are
+            // `-name\0w11\0`, so the space is not there. Splitting on NUL first is what makes the
+            // comparison meaningful, and checking the ARGUMENT rather than a joined string avoids
+            // matching a path that happens to contain the same text.
+            let cmdline = std::fs::read(path.join("cmdline")).unwrap_or_default();
+            let args: Vec<String> = cmdline
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+
+            let mut names_this_vm = false;
+            for pair in args.windows(2) {
+                if pair[0] == "-name" && pair[1] == self.config.name {
+                    names_this_vm = true;
+                    break;
+                }
+            }
+
+            if names_this_vm {
+                return Some(pid);
+            }
+        }
+
+        None
     }
 
     /// Create the state directory and the disk image if they do not exist.

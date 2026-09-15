@@ -130,7 +130,26 @@ pub fn handle(request: &Request) -> Response {
             }
         }
 
-        Request::Capture { .. } => not_yet("capture"),
+        Request::Capture { monitor } => {
+            // The guest captures its own screen rather than the host reaching into the
+            // framebuffer over QMP. Both work; the guest route goes through the grant check and
+            // the journal, which is the whole point of this design. See capture.rs.
+            match crate::capture::capture(*monitor) {
+                Ok(frame) => Response::Ok {
+                    payload: Payload::Frame {
+                        png_base64: crate::base64::encode(&frame.png),
+                        width: frame.width,
+                        height: frame.height,
+                    },
+                },
+                // A headless guest genuinely cannot be screenshotted, and saying so is the point:
+                // a black image would be indistinguishable from a dark screen.
+                Err(e) => Response::Error {
+                    message: format!("capture: {e}"),
+                },
+            }
+        }
+
         Request::Input { .. } => not_yet("input"),
         Request::Transfer { .. } => not_yet("transfer"),
         Request::Lifecycle { .. } => not_yet("lifecycle"),
@@ -219,11 +238,10 @@ mod tests {
     fn unimplemented_operations_report_honestly() {
         // The critical property: a stub must never look like a success.
         //
-        // `exec` is no longer in this list — it has a real implementation now. On a host build
-        // that implementation cannot run, so it returns an explicit error saying so; that is
-        // covered by `exec_on_a_host_build_refuses_rather_than_pretending`.
+        // `exec` and `capture` are no longer here — both have real implementations. On a host
+        // build their platform halves cannot run, and each reports that explicitly rather than
+        // claiming to be unwritten; see the tests below.
         let cases = vec![
-            Request::Capture { monitor: 0 },
             Request::Input {
                 event: InputEvent::MouseMove { x: 0, y: 0 },
             },
@@ -280,6 +298,29 @@ mod tests {
                 );
             }
             other => panic!("a platform-absent exec must not report success; got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn capture_on_a_host_build_refuses_rather_than_returning_a_blank_image() {
+        // A capture stub that returned a fabricated black PNG would be far worse than one that
+        // refuses: it would look like a successful screenshot of a dark screen, and there is no
+        // way to tell those apart from the caller's side.
+        match handle(&Request::Capture { monitor: 0 }) {
+            Response::Error { message } => {
+                if cfg!(windows) {
+                    panic!("capture failed inside a Windows guest: {message}");
+                }
+                assert!(
+                    message.contains("Windows build"),
+                    "the refusal must name the platform: {message}"
+                );
+                assert!(
+                    !message.contains("not implemented"),
+                    "capture is implemented; only its platform half is absent here: {message}"
+                );
+            }
+            other => panic!("a platform-absent capture must not report success; got {other:?}"),
         }
     }
 

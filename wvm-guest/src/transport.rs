@@ -48,12 +48,30 @@ pub enum Listener {
 }
 
 impl Listener {
-    pub fn incoming(&self) -> Box<dyn Iterator<Item = Result<TcpConnection>> + '_> {
+    /// Accept one connection if one is waiting.
+    ///
+    /// `Ok(None)` means nothing is pending, which requires the listener to be non-blocking. It is
+    /// NOT an error: a poll loop that treated it as one would log a line every 100ms while idle.
+    ///
+    /// The distinction matters because the alternative — blocking in `accept` — means a stop
+    /// request is never noticed, which is exactly what happened: `sc.exe stop` left the service
+    /// RUNNING and holding its own binary open, so the next deploy could not replace it.
+    pub fn accept(&self) -> Result<Option<TcpConnection>> {
         match self {
-            Listener::Tcp(l) => Box::new(l.incoming().map(|r| {
-                r.map(TcpConnection::new)
-                    .context("accepting a connection from the host")
-            })),
+            Listener::Tcp(l) => match l.accept() {
+                Ok((stream, _)) => Ok(Some(TcpConnection::new(stream))),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(e).context("accepting a connection from the host"),
+            },
+        }
+    }
+
+    /// Put the listener into non-blocking mode so `accept` can be polled.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        match self {
+            Listener::Tcp(l) => l
+                .set_nonblocking(nonblocking)
+                .context("setting the listener's blocking mode"),
         }
     }
 }

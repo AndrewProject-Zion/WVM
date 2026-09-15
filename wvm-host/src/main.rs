@@ -12,6 +12,7 @@
 //! not already granted.
 
 mod doctor;
+mod image;
 mod journal;
 mod policy;
 mod server;
@@ -146,6 +147,28 @@ enum VmAction {
         #[arg(long, default_value_t = 40)]
         lines: usize,
     },
+
+    /// Capture the guest's screen as a PNG.
+    ///
+    /// Runs against the QEMU framebuffer rather than inside the guest. The guest cannot do this at
+    /// all: a Windows service runs in session 0, which has no desktop. See
+    /// `supervisor::Qmp::screendump`, and `docs/DECISIONS.md` D-009.
+    Capture {
+        #[arg(long, default_value = "wvm.toml", global = true)]
+        config: std::path::PathBuf,
+
+        /// Where to write the PNG. `-` writes to stdout.
+        #[arg(long, short)]
+        out: String,
+
+        /// Reject a capture whose dimensions do not match this, as `WIDTHxHEIGHT`.
+        ///
+        /// A screendump can succeed and be the wrong thing — a stale framebuffer, a resized
+        /// display, a VM that has not finished booting. Asserting the expected geometry turns
+        /// "a file appeared" into a check that means something.
+        #[arg(long)]
+        expect: Option<String>,
+    },
 }
 
 /// The requests `wvm call` can send. Raw JSON is available via the client library for anything
@@ -250,7 +273,8 @@ fn run_vm(action: VmAction) -> Result<()> {
         | VmAction::Start { config, .. }
         | VmAction::Suspend { config }
         | VmAction::Shutdown { config, .. }
-        | VmAction::Log { config, .. } => config.clone(),
+        | VmAction::Log { config, .. }
+        | VmAction::Capture { config, .. } => config.clone(),
     };
 
     // Validate before constructing the supervisor: a bad definition should be reported as a
@@ -377,7 +401,77 @@ fn run_vm(action: VmAction) -> Result<()> {
             println!("{}", supervisor.serial_tail(lines)?);
             Ok(())
         }
+
+        VmAction::Capture { out, expect, .. } => {
+            let config = supervisor.config();
+
+            // The VM must be running: a capture from a stopped VM would either fail or, worse,
+            // return a stale framebuffer left over from the last time it ran.
+            if !supervisor.state().is_running() {
+                anyhow::bail!(
+                    "the VM is not running, so there is nothing to capture. \
+                     Start it with `wvm vm start`"
+                );
+            }
+
+            // QMP writes to a path, so go through a temporary file and read it back.
+            let scratch =
+                std::env::temp_dir().join(format!("wvm-capture-{}.ppm", std::process::id()));
+
+            let mut qmp = supervisor::Qmp::connect(&config.qmp_socket())?;
+            qmp.screendump(&scratch, None)?;
+
+            let image = image::read_ppm(&scratch)?;
+            // Clean up before the size check, so a rejected capture does not leave the scratch file
+            // behind to be found later and mistaken for a real result.
+            let _ = std::fs::remove_file(&scratch);
+
+            if let Some(spec) = &expect {
+                let (w, h) = parse_geometry(spec)?;
+                if image.width != w || image.height != h {
+                    anyhow::bail!(
+                        "the capture is {}x{} but {spec} was expected. \n\
+                         A screendump can succeed and still be the wrong thing: a stale \
+                         framebuffer, a resized display, or a guest that has not finished booting.",
+                        image.width,
+                        image.height
+                    );
+                }
+            }
+
+            let png = image::encode_png(&image)?;
+
+            if out == "-" {
+                use std::io::Write;
+                std::io::stdout().write_all(&png)?;
+            } else {
+                std::fs::write(&out, &png)?;
+                eprintln!(
+                    "captured {}x{} -> {out} ({} bytes)",
+                    image.width,
+                    image.height,
+                    png.len()
+                );
+            }
+
+            Ok(())
+        }
     }
+}
+
+/// Parse a `WIDTHxHEIGHT` geometry string.
+fn parse_geometry(spec: &str) -> Result<(u32, u32)> {
+    let (w, h) = spec
+        .split_once(['x', 'X'])
+        .ok_or_else(|| anyhow::anyhow!("expected WIDTHxHEIGHT, got {spec:?}"))?;
+    Ok((
+        w.trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("bad width in {spec:?}: {e}"))?,
+        h.trim()
+            .parse()
+            .map_err(|e| anyhow::anyhow!("bad height in {spec:?}: {e}"))?,
+    ))
 }
 
 /// Parse a verb name. Unknown names are reported rather than silently dropped: a grant that is
