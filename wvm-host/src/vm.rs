@@ -384,6 +384,26 @@ impl VmConfig {
         // surgery is worth considerably more than a faster NIC that does not.
         a.push("e1000e,netdev=net0".into());
 
+        // An absolute pointing device, in addition to the emulated PS/2 mouse.
+        //
+        // Without this the guest sees only a RELATIVE mouse: `mouse_move` deltas accumulate, so
+        // moving to a known point requires tracking where the pointer already is, and any lost
+        // event desynchronises it permanently. Clicking a button at a known coordinate is how
+        // anything gets driven, and it cannot be done reliably against a relative device.
+        //
+        // `usb-tablet` reports ABSOLUTE coordinates, so a position is a position rather than a
+        // displacement. Windows has an in-box driver for it, so nothing needs installing in the
+        // guest — the same reasoning as e1000e over virtio-net.
+        //
+        // The controller must be added FIRST. q35 has no USB bus by default, so `usb-tablet`
+        // alone fails with "No 'usb-bus' bus found for device 'usb-tablet'" — which is exactly
+        // what happened when this was added without it. The device and the bus it attaches to
+        // are one change, not two.
+        a.push("-device".into());
+        a.push("qemu-xhci,id=xhci0".into());
+        a.push("-device".into());
+        a.push("usb-tablet,bus=xhci0.0".into());
+
         // Headless by default (D-004). No display backend at all, so nothing depends on a
         // desktop session being present.
         a.push("-display".into());
@@ -501,6 +521,48 @@ mod tests {
         assert!(
             joined.contains("-cpu host"),
             "the host CPU model is required"
+        );
+    }
+
+    #[test]
+    fn the_absolute_pointer_has_a_controller_to_attach_to() {
+        // Regression guard with a specific failure behind it. `usb-tablet` was added without a USB
+        // controller, and QEMU refused to start:
+        //     -device usb-tablet: No 'usb-bus' bus found for device 'usb-tablet'
+        // q35 provides no USB bus by default. The guest then reported "running but unresponsive"
+        // because QEMU had created the QMP socket before exiting, so the symptom was a QMP
+        // connection refused rather than an obvious argument error.
+        //
+        // The device and its bus are one change. Asserting both, and the ORDER, because the
+        // controller must be declared before the device that sits on it.
+        let args = config().qemu_args();
+        let joined = args.join(" ");
+
+        assert!(
+            joined.contains("usb-tablet"),
+            "the guest needs an absolute pointer: {joined}"
+        );
+        assert!(
+            joined.contains("qemu-xhci"),
+            "usb-tablet needs a USB controller on q35: {joined}"
+        );
+
+        let controller = args
+            .iter()
+            .position(|a| a.contains("qemu-xhci"))
+            .expect("controller present");
+        let tablet = args
+            .iter()
+            .position(|a| a.contains("usb-tablet"))
+            .expect("tablet present");
+        assert!(
+            controller < tablet,
+            "the controller must be declared before the device that sits on its bus"
+        );
+
+        assert!(
+            joined.contains("bus=xhci0.0"),
+            "usb-tablet must name the bus it attaches to: {joined}"
         );
     }
 

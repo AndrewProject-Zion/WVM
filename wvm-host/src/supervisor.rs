@@ -154,6 +154,170 @@ impl Qmp {
         }
         bail!("timed out waiting for the QMP event '{name}'")
     }
+
+    /// Send one key event, as an explicit press or release.
+    ///
+    /// `input-send-event` is used rather than the older `send-key` because it models press and
+    /// release separately. `send-key` presses everything it is given and releases it again, so a
+    /// chord like Ctrl+Alt+Delete arrives as four separate taps rather than a held combination,
+    /// and a key cannot be held across a subsequent one at all.
+    pub fn send_key_event(&mut self, event: &crate::input::KeyEvent) -> Result<()> {
+        let mut events = Vec::new();
+
+        if event.down {
+            // Modifiers go down first, in the order given, and are released in reverse afterwards.
+            for modifier in &event.modifiers {
+                events.push(json!({
+                    "type": "key",
+                    "data": { "down": true, "key": { "type": "qcode", "data": modifier } }
+                }));
+            }
+            events.push(json!({
+                "type": "key",
+                "data": { "down": true, "key": { "type": "qcode", "data": event.key } }
+            }));
+        } else {
+            events.push(json!({
+                "type": "key",
+                "data": { "down": false, "key": { "type": "qcode", "data": event.key } }
+            }));
+            for modifier in event.modifiers.iter().rev() {
+                events.push(json!({
+                    "type": "key",
+                    "data": { "down": false, "key": { "type": "qcode", "data": modifier } }
+                }));
+            }
+        }
+
+        self.execute("input-send-event", Some(json!({ "events": events })))?;
+        Ok(())
+    }
+
+    /// Press a chord: every key but the last is held down across the final key.
+    ///
+    /// The modifier must be held ACROSS the keypress. Releasing it first — or sending the keys as
+    /// separate presses — is read by Windows as the modifier key alone followed by an unrelated
+    /// key, which is why an early attempt at Meta+R opened the Start menu instead of the Run box.
+    pub fn send_chord(&mut self, keys: &[String]) -> Result<()> {
+        if keys.is_empty() {
+            bail!("a chord needs at least one key");
+        }
+
+        let mut events = Vec::new();
+
+        for modifier in &keys[..keys.len() - 1] {
+            events.push(json!({
+                "type": "key",
+                "data": { "down": true, "key": { "type": "qcode", "data": modifier } }
+            }));
+        }
+
+        let last = keys.last().expect("checked non-empty");
+        events.push(json!({
+            "type": "key",
+            "data": { "down": true, "key": { "type": "qcode", "data": last } }
+        }));
+        events.push(json!({
+            "type": "key",
+            "data": { "down": false, "key": { "type": "qcode", "data": last } }
+        }));
+
+        for modifier in keys[..keys.len() - 1].iter().rev() {
+            events.push(json!({
+                "type": "key",
+                "data": { "down": false, "key": { "type": "qcode", "data": modifier } }
+            }));
+        }
+
+        self.execute("input-send-event", Some(json!({ "events": events })))?;
+        Ok(())
+    }
+
+    /// Move the pointer to an absolute position.
+    ///
+    /// Uses the absolute axis, which requires a `usb-tablet` on the VM. Without one the guest has
+    /// only a relative PS/2 mouse and a coordinate cannot be expressed — the position would be a
+    /// displacement from wherever the pointer happens to be.
+    pub fn send_pointer_move(&mut self, x: i32, y: i32) -> Result<()> {
+        // A scaled axis takes a value in the range 0..=0x7fff mapped across the full width or
+        // height, rather than a pixel coordinate. The guest's resolution is therefore not needed
+        // here, which avoids the two getting out of step.
+        const SCALE: i64 = 0x7fff;
+
+        let (width, height) = self.query_screen_size()?;
+        if width == 0 || height == 0 {
+            bail!("the guest reports a {width}x{height} screen; cannot map a coordinate onto it");
+        }
+
+        let sx = (x as i64 * SCALE / width as i64).clamp(0, SCALE) as i32;
+        let sy = (y as i64 * SCALE / height as i64).clamp(0, SCALE) as i32;
+
+        let events = vec![
+            json!({ "type": "abs", "data": { "axis": "x", "value": sx } }),
+            json!({ "type": "abs", "data": { "axis": "y", "value": sy } }),
+        ];
+        self.execute("input-send-event", Some(json!({ "events": events })))?;
+
+        // A short settle. The guest processes the axis events asynchronously, and a button event
+        // sent in the same batch can be applied at the previous position — a click that lands
+        // somewhere else, which is the worst kind of wrong because it usually succeeds.
+        std::thread::sleep(Duration::from_millis(60));
+        Ok(())
+    }
+
+    /// Press or release a mouse button.
+    pub fn send_pointer_button(&mut self, button: &str, down: bool) -> Result<()> {
+        let name = match button {
+            "left" => "left",
+            "right" => "right",
+            "middle" => "middle",
+            other => bail!("unknown mouse button {other:?}; use left, right or middle"),
+        };
+
+        let events = vec![json!({
+            "type": "btn",
+            "data": { "down": down, "button": name }
+        })];
+        self.execute("input-send-event", Some(json!({ "events": events })))?;
+        Ok(())
+    }
+
+    /// Ask the guest what resolution it is running at.
+    ///
+    /// Read rather than assumed: mapping a coordinate onto the wrong dimensions puts the pointer
+    /// somewhere valid-looking and wrong.
+    ///
+    /// # How, and why not a QMP query
+    ///
+    /// There is no reliable QMP command for this. `query-displays` does not exist on this QEMU
+    /// (verified against `query-commands`), and the display device's geometry is not reachable
+    /// through the QOM tree either — `/machine/graphics` reports `DeviceNotFound`.
+    ///
+    /// So this takes a screendump and reads the dimensions out of the PPM header. That is exact,
+    /// it is the same framebuffer the pointer coordinates map onto, and it reuses a path that is
+    /// already written and tested rather than adding a second, less reliable one.
+    ///
+    /// The cost is a screendump per absolute move, which for a 1024x768 guest is about 2 MB read
+    /// from a temporary file and immediately discarded. That is worth paying for coordinates that
+    /// are right: a click that lands at the wrong place usually still succeeds, which makes it the
+    /// worst kind of wrong.
+    pub fn query_screen_size(&mut self) -> Result<(u32, u32)> {
+        let scratch = std::env::temp_dir().join(format!("wvm-geometry-{}.ppm", std::process::id()));
+
+        self.screendump(&scratch, None)?;
+
+        // Only the header is needed, but reading the file is simpler than a partial read and the
+        // file is removed immediately either way.
+        let result = crate::image::read_ppm(&scratch).map(|img| (img.width, img.height));
+        let _ = std::fs::remove_file(&scratch);
+
+        let (width, height) = result?;
+        if width == 0 || height == 0 {
+            bail!("the guest framebuffer reports {width}x{height}; a coordinate cannot be mapped");
+        }
+
+        Ok((width, height))
+    }
 }
 
 /// Current state of a VM, as observed rather than assumed.

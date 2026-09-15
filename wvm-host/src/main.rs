@@ -13,6 +13,7 @@
 
 mod doctor;
 mod image;
+mod input;
 mod journal;
 mod policy;
 mod server;
@@ -169,6 +170,57 @@ enum VmAction {
         #[arg(long)]
         expect: Option<String>,
     },
+
+    /// Send input to the guest: keys, text, or a click at a coordinate.
+    ///
+    /// Delivered as emulated HARDWARE through QEMU, not through Windows input APIs. That matters:
+    /// a Windows service runs in session 0 and `SendInput` from there cannot reach the interactive
+    /// session, but a device event is delivered by the kernel to whichever session owns the active
+    /// console. See `docs/DECISIONS.md` D-010.
+    Input {
+        #[arg(long, default_value = "wvm.toml", global = true)]
+        config: std::path::PathBuf,
+
+        #[command(subcommand)]
+        action: InputAction,
+    },
+}
+
+/// What to send to the guest.
+#[derive(Debug, Subcommand)]
+enum InputAction {
+    /// Type a literal string.
+    ///
+    /// Each character is translated to the key events that produce it on a UK layout, which is the
+    /// guest's layout. A map written for a US keyboard sends `@` where `"` was intended — the bug
+    /// that stalled M4 for most of a session.
+    Text {
+        /// The string to type.
+        value: String,
+    },
+
+    /// Press a named key or a `+`-separated chord, e.g. `ret`, `esc`, `ctrl+c`.
+    Key {
+        /// QOM key names, joined with `+` for a chord.
+        spec: String,
+    },
+
+    /// Move the pointer to an absolute coordinate and optionally click.
+    ///
+    /// Requires the VM to have a `usb-tablet`, which the generated command line includes. Without
+    /// it the guest sees only a relative mouse and an absolute move is not expressible.
+    Click {
+        x: i32,
+        y: i32,
+
+        /// Which button.
+        #[arg(long, default_value = "left")]
+        button: String,
+
+        /// Move without clicking, to see where the pointer lands first.
+        #[arg(long)]
+        no_click: bool,
+    },
 }
 
 /// The requests `wvm call` can send. Raw JSON is available via the client library for anything
@@ -274,7 +326,8 @@ fn run_vm(action: VmAction) -> Result<()> {
         | VmAction::Suspend { config }
         | VmAction::Shutdown { config, .. }
         | VmAction::Log { config, .. }
-        | VmAction::Capture { config, .. } => config.clone(),
+        | VmAction::Capture { config, .. }
+        | VmAction::Input { config, .. } => config.clone(),
     };
 
     // Validate before constructing the supervisor: a bad definition should be reported as a
@@ -452,6 +505,53 @@ fn run_vm(action: VmAction) -> Result<()> {
                     image.height,
                     png.len()
                 );
+            }
+
+            Ok(())
+        }
+
+        VmAction::Input { action, .. } => {
+            let config = supervisor.config();
+
+            if !supervisor.state().is_running() {
+                anyhow::bail!(
+                    "the VM is not running, so there is nothing to send input to. \
+                     Start it with `wvm vm start`"
+                );
+            }
+
+            let mut qmp = supervisor::Qmp::connect(&config.qmp_socket())?;
+
+            match action {
+                InputAction::Text { value } => {
+                    let events = input::translate(&value)?;
+                    for event in &events {
+                        qmp.send_key_event(event)?;
+                    }
+                    println!("typed {} character(s)", value.chars().count());
+                }
+
+                InputAction::Key { spec } => {
+                    let keys = input::parse_chord(&spec)?;
+                    qmp.send_chord(&keys)?;
+                    println!("sent {spec}");
+                }
+
+                InputAction::Click {
+                    x,
+                    y,
+                    button,
+                    no_click,
+                } => {
+                    qmp.send_pointer_move(x, y)?;
+                    if no_click {
+                        println!("moved the pointer to ({x}, {y})");
+                    } else {
+                        qmp.send_pointer_button(&button, true)?;
+                        qmp.send_pointer_button(&button, false)?;
+                        println!("clicked {button} at ({x}, {y})");
+                    }
+                }
             }
 
             Ok(())
