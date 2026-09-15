@@ -200,9 +200,23 @@ pub fn run(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
+    // A job object for the whole tree, created BEFORE the child exists.
+    //
+    // `Child::kill()` terminates one process. Without this, a timeout that killed `cmd.exe` left
+    // whatever the command had spawned running — orphaned and invisible, still holding memory and
+    // handles. Repeatedly, that is how a sandbox is bricked by its own workload.
+    #[cfg(windows)]
+    let job = crate::job::JobObject::kill_on_close()
+        .map_err(|e| anyhow!("could not create a job object for '{program}': {e}"))?;
+
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("could not start '{program}': {e}"))?;
+
+    // Put it in the job immediately, so anything IT spawns is in the job too.
+    #[cfg(windows)]
+    job.assign(&child)
+        .map_err(|e| anyhow!("could not isolate '{program}' in a job object: {e}"))?;
 
     // Drain both pipes on their own threads, starting NOW, before we wait for the process.
     //
@@ -242,9 +256,22 @@ pub fn run(
             }
             Ok(None) => {
                 if started.elapsed() >= deadline {
-                    // Kill, then reap. Leaving a killed-but-unreaped child would hold its handles
-                    // and pipe buffers, and the zombie would persist for the life of the service.
+                    // Kill the WHOLE tree, then reap the leader.
+                    //
+                    // On Windows, dropping the job handle is the kill: KILL_ON_JOB_CLOSE terminates
+                    // every process in the job, and job membership is inherited, so grandchildren
+                    // die too. `child.kill()` alone would terminate one process and leave the rest.
+                    #[cfg(windows)]
+                    {
+                        let job = job;
+                        drop(job);
+                    }
+                    // Belt and braces: on Unix the job object does not exist, and killing the direct
+                    // child is all that is available. Keeping both means the behaviour is defined on
+                    // whichever platform this is built for.
                     let _ = child.kill();
+                    // Reap, so the leader is not left as a zombie holding its handle. Killing
+                    // without waiting is how a process table fills up.
                     let _ = child.wait();
                     outcome = Outcome::TimedOut {
                         killed_after_ms: started.elapsed().as_millis() as u64,

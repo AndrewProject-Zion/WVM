@@ -18,6 +18,7 @@ mod capture;
 mod chunk;
 mod dispatch;
 mod fsio;
+mod job;
 mod log;
 mod paths;
 mod pull;

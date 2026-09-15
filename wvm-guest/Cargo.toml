@@ -34,4 +34,13 @@ windows-sys = { version = "0.59", features = [
     # that give its bounds.
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    # Job objects: the only way to kill a whole process TREE on Windows. `Child::kill()` terminates
+    # one process, so a timed-out command that spawned its own children left them running — orphaned
+    # and still consuming resources. See `wvm-guest/src/job.rs`.
+    #
+    # `Win32_Security` is required by the feature gate on `CreateJobObjectW`, which takes a
+    # `SECURITY_ATTRIBUTES` pointer. Passing null means "default security", but the type still has to
+    # exist for the binding to compile.
+    "Win32_System_JobObjects",
+    "Win32_Security",
 ] }
