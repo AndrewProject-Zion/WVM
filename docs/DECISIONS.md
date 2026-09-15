@@ -181,3 +181,78 @@ different protocols with different command names.** Any QMP implementation must 
 against `query-commands` on the actual QEMU build, not written from memory of the HMP console.
 
 ---
+
+## D-007 — The guest is a Windows service, with console mode kept alongside it
+
+**Date:** 2026-09-15
+**Status:** accepted
+
+**Context.** The guest binary was a console program that bound a socket and looped. It was installed
+with `sc.exe create`, which reported SUCCESS, and the service then never ran: `sc.exe query` showed
+an entry that existed, nothing listened on the port, and the host round trip timed out.
+
+`sc.exe create` registers a binary **path**. It does not make a program a service. The Service
+Control Manager starts the process and waits for it to call `StartServiceCtrlDispatcher`, report
+`SERVICE_RUNNING`, and stand by for control requests. A console program does none of that, so the
+SCM waits out its timeout and marks the service failed.
+
+**Decision.** Implement the SCM conversation in a dedicated module (`wvm-guest/src/service.rs`)
+that owns nothing else, and delegate the actual work to the same `serve_loop` the console path uses.
+Console mode is retained, selected by an explicit `--service` flag rather than inferred from the
+environment.
+
+**Rejected alternatives.**
+
+*Inferring service context* (checking for arguments, or probing for an SCM dispatcher) is guesswork
+where a flag is a fact. The installer knows which mode it wants; it says so.
+
+*Two implementations, one per mode.* They drift. A service and a console run are the same behaviour
+started differently, so there is one `serve_loop` and two entry points into it.
+
+*Dropping console mode once the service worked.* Running the binary by hand and reading its output
+was the only way to see this failure at all. A service whose only interface is the event log is
+markedly harder to diagnose, and the debugging value is worth the small amount of extra code.
+
+**Consequence, and a known gap.** The control handler signals a channel and returns immediately —
+it must, because the SCM serialises control requests and blocking in the handler stalls stop for
+every service call. But the serving loop blocks in `accept`, so a stop request does not interrupt
+it and the SCM eventually kills the process. Closing this needs a non-blocking accept with a poll
+timeout. It is recorded here rather than half-implemented: **an advertised graceful stop that does
+not stop is worse than one that honestly waits.**
+
+**Generalisation.** "Registered" and "running" are different claims, and only the second one
+matters. This is the same shape as D-005: a check that cannot distinguish success from failure is
+not a check. The installer now verifies a **listening socket**, not the service list.
+
+---
+
+## D-008 — A TCP connect is not proof that the guest is reachable
+
+**Date:** 2026-09-15
+**Status:** accepted
+
+**Context.** During M4 development, a TCP connect to the forwarded port (`127.0.0.1:48274`)
+succeeded consistently while the guest service was not running, was not installed, and — on one
+occasion — while the guest had no network adapter at all. It would have been easy to record a
+passing transport on a guest that could not receive anything.
+
+The cause is QEMU's user-mode networking. slirp completes the TCP handshake **locally, on the
+host's behalf**, and only then attempts to deliver to the guest. The guest's answer to that attempt
+arrives later, or never. So a `connect()` returning success says nothing about whether anything is
+listening on the other side.
+
+**Decision.** Any check of the guest channel must **exchange frames**. A round trip that sends a
+length-prefixed request and receives a length-prefixed response is the smallest thing that
+distinguishes a working channel from a plausible one. `scripts/talk-to-guest.py` exists for this and
+prints an explicit warning about the connect being meaningless, so the number cannot be misread.
+
+**Rejected alternative.** Treating `connect()` as a liveness check. It is faster and it is wrong:
+its success and failure modes are indistinguishable in exactly the case that matters — when
+something is listening on the host side and nothing on the guest side.
+
+**Consequence.** This is the fourth instance of one lesson, which is why it is written down
+separately from the others (D-005 on metadata, the held-key reordering, and the `100`-token
+abliteration budget are the family). **A check whose failure mode cannot be told apart from its
+success mode is not a check — it is a coin that always lands heads.**
+
+---

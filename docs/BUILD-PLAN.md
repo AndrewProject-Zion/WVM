@@ -160,36 +160,69 @@ requirements, so no `swtpm` process is needed and the generated command line del
 one. See `docs/VM-CONFIG.md`.
 
 
-## M4 — Guest service
+## M4 — Guest service  ← COMPLETE
 
-- [x] `wvm-guest` cross-compiled from Linux (440 KB PE32+, core DLLs only)
+- [x] `wvm-guest` cross-compiled from Linux (550 KB PE32+, core DLLs only)
 - [x] Length-prefixed framing matching the host, transport behind a trait
 - [x] Windows path canonicalisation with containment rules
 - [x] Transfer planning and execution, with overwrite refusal
 - [x] Installer script for registering the service in the guest
-- [ ] Install as a service in the running guest (script written, not yet run)
-- [ ] Verify the guest can reach the host over the forwarded port
-- [ ] Process launch with stdout/stderr capture and exit code
-- [ ] Input injection and framebuffer capture
-- [ ] Wire the transport, paths and transfer modules into `dispatch`
+- [x] Install as a service in the running guest
+- [x] Verify the guest can reach the host over the forwarded port
+- [x] Process launch with stdout/stderr capture and exit code
+- [x] Wire the transport, paths and transfer modules into `dispatch`
+- [ ] Input injection and framebuffer capture  ← M5
 
-**Verified so far:** the guest binary cross-compiles and imports only `KERNEL32`, `msvcrt`,
-`ntdll`, `WS2_32` and `api-ms-win-core-synch-l1-2-0` — no VC++ redistributable to install inside a
-debloated guest. The guest crate carries 36 tests, all of which run on the host: 16 for path
-canonicalisation, 13 for transfer containment, and 7 for dispatch. Workspace total: 116.
+**Verified end to end**, driven from Linux with no console and no keyboard:
 
-**Why the platform layer is still stubbed.** `dispatch` returns an explicit
-`{op}: not implemented in this build` for anything needing the guest, and a test asserts that a
-stub never reports success. The transport, path and transfer modules are real and tested; what
-remains is the Win32 layer.
+```
+hello  ->  {"status":"ready","protocol_version":1,"guest":"Windows (wvm-guest 0.1.0)"}
 
-**The guest now exists to develop against.** Windows 11 (tiny11 2311) is installed and running,
-with Windows Terminal available. See `docs/WINDOWS-INSTALL-STATUS.md` for what was installed and how
-it was verified.
+exec   ->  {"result":"process_output","outcome":"exited","code":0,
+            "stdout":"\r\nMicrosoft Windows [Version 10.0.22631.2715]\r\n",
+            "elapsed_ms":37}
+```
 
-**Next concrete step:** confirm the guest can reach the host's forwarded port
-(`127.0.0.1:48274` on the host → guest `:48273`). That validates the whole transport path before
-any Win32 code is written against it — a two-minute test that de-risks the rest of the milestone.
+A process launched inside Windows, its output captured, returned to the host.
+
+**What made it a service, and the distinction that mattered.** `sc.exe create` registers a binary
+path; it does not make a program a service. The SCM starts the process and waits for it to call
+`StartServiceCtrlDispatcher` and report `SERVICE_RUNNING`. A console program does neither, so the
+SCM waits out its timeout and marks the service failed — while `create` reports SUCCESS and `query`
+shows an entry that exists but never runs. `wvm-guest/src/service.rs` owns that conversation and
+nothing else, delegating the work to the same `serve_loop` console mode uses.
+
+Console mode is kept deliberately: running the binary by hand is what makes a service install
+diagnosable, and was the only way to see this failure.
+
+**The bind address that could never have worked.** `default_bind()` was `127.0.0.1:48273`. The
+host's forward arrives as an INBOUND connection on the guest's external interface; the `127.0.0.1`
+binds the host end and says nothing about where the packet lands inside the guest. The service
+would have listened and accepted nothing, forever, with every host-side check reporting healthy.
+Now `0.0.0.0`, with the reasoning recorded.
+
+**Three faults in the input tooling, one root cause — the keymap was written for a US keyboard and
+the guest is UK.** Each presented as a different plausible fault, and each was found by measuring
+rather than reasoning:
+
+| Fault | Symptom | Misdiagnosed as |
+|---|---|---|
+| `"` → SHIFT+apostrophe (yields `@`) | `sc.exe` rejected its own quoting | a bad path / permissions |
+| `backslash` → `#` (US physical position) | pnputil: "missing driver package" | a bad driver disc |
+| `send-key` held each key 60ms | characters reordered to the line start | a line-length limit |
+
+The reordering one was measured with `scripts/probe-typing-limit.py`, which disproved the
+length-limit theory: nothing was dropped or split, and 110-character lines arrived intact once the
+hold was replaced with explicit press/release events.
+
+**Also learned:** a TCP connect to a forwarded port is NOT proof of anything. slirp completes the
+handshake locally and only then tries to deliver, so a connect succeeds against a guest with no
+service listening. Success and failure look identical. Proof requires a round trip that exchanges
+real frames.
+
+**Tests:** 131 across the workspace, 0 clippy warnings, Windows cross-compile clean.
+
+See `docs/WINDOWS-INSTALL-STATUS.md` for what is installed in the guest and how to drive it.
 
 
 ## M5 — Agent surface

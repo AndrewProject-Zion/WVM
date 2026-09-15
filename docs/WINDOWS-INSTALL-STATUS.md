@@ -93,6 +93,72 @@ Both must agree on `firmware = "bios"`.
 
 ## Verifying the guest from the host
 
+A TCP connect to a forwarded port proves **nothing**. QEMU's user-mode networking completes the
+handshake locally and only then tries to deliver to the guest, so a connect succeeds even against a
+guest with nothing listening. Success and failure look identical.
+
+Proof requires exchanging real frames:
+
+```sh
+python3 scripts/talk-to-guest.py hello                     # handshake
+python3 scripts/talk-to-guest.py inspect                   # inventory
+python3 scripts/talk-to-guest.py exec -- cmd.exe /c ver    # run something, capture output
+```
+
+A working round trip returns:
+
+```json
+{"status":"ready","protocol_version":1,"guest":"Windows (wvm-guest 0.1.0)"}
+```
+
+Two checks that between them prove the channel:
+
+```sh
+ss -tlnp | grep 48274                 # the host forward is bound
+netstat -an                           # inside the guest: something on 48273
+```
+
+## Network access from the guest
+
+The guest can reach the host at **`10.0.2.2`**, and the host's LAN IP also works. Useful for moving
+a build into the guest during development:
+
+```sh
+# on the host
+cd scripts && python3 -m http.server 8899 --bind 0.0.0.0
+
+# in the guest
+curl -o file.exe 10.0.2.2:8899/file.exe
+```
+
+For reading output **out** of the guest — which matters because an elevated console cannot be
+captured after it closes — run the receiver on the host and push from the guest:
+
+```sh
+python3 scripts/guest-upload-server.py --port 8900
+```
+
+```powershell
+sc.exe query wvm-guest 2>&1 | Out-File -Encoding utf8 out.txt
+curl -T out.txt http://10.0.2.2:8900/
+```
+
+Files land in `~/.local/state/wvm/inbox/`. Handles `curl -T -` chunked encoding.
+
+## Driving it without typing
+
+Typing into the guest console works for short commands and is unreliable past roughly 110
+characters, and it depends on which window has focus — after a boot there is none, so keystrokes go
+nowhere. Two consequences learned the hard way:
+
+- **Long commands belong in a file.** Put the work in a script, serve it over HTTP, and type only
+  the short command that fetches and runs it. `scripts/guest-bootstrap.cmd` is that pattern.
+- **`sc` and `copy` are PowerShell aliases** for `Set-Content` and `Copy-Item`, and parse their
+  arguments differently — they never reach the program you meant. Use `sc.exe` and `cmd /c copy`.
+  The symptom is a confusing "positional parameter" error, not an unrecognised-command error.
+
+Once the service is installed, none of this is needed: drive it over the control channel.
+
 The guest is headless by default. To see what it is doing without a display:
 
 ```sh
