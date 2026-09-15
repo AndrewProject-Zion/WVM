@@ -19,16 +19,42 @@ mod transfer;
 mod transport;
 mod win32;
 
+#[cfg(windows)]
+mod service;
+
 use anyhow::Result;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let bind = transport::default_bind();
 
-    let addr = parse_bind(&args).unwrap_or(bind);
+    // Service mode: hand over to the SCM dispatcher, which calls back into `service::service_main`
+    // on its own thread. Without this the process is just a console program, and the SCM will
+    // start it, wait for a status report that never comes, and mark it failed — which is exactly
+    // what happened before this existed.
+    #[cfg(windows)]
+    if args.iter().any(|a| a == "--service") {
+        return service::run();
+    }
 
-    eprintln!("wvm-guest: listening on {}", addr);
-    let listener = transport::listen(&addr)?;
+    // Console mode. Kept deliberately: running the binary by hand and reading its output is what
+    // makes a service install diagnosable.
+    let addr = parse_bind(&args).unwrap_or_else(transport::default_bind);
+    serve_loop(&addr, move |port| {
+        eprintln!("wvm-guest: listening on {port}");
+    })
+}
+
+/// Bind, accept, and serve, until the process is asked to stop.
+///
+/// Shared by console mode and the Windows service, so there is one implementation of the actual
+/// behaviour rather than two that drift. `on_ready` is called once the socket is bound, which is
+/// where console mode prints and where a service would report its state.
+pub fn serve_loop<F>(addr: &str, on_ready: F) -> Result<()>
+where
+    F: FnOnce(&str),
+{
+    let listener = transport::listen(addr)?;
+    on_ready(addr);
 
     for stream in listener.incoming() {
         match stream {

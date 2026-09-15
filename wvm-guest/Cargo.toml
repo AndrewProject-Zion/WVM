@@ -19,6 +19,11 @@ anyhow.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# The `windows-service` crate owns the SCM conversation — StartServiceCtrlDispatcher, the control
+# handler registration, and status reporting. Hand-rolling that against windows-sys would mean
+# reproducing a well-specified state machine, and any mistake in it presents as a service that
+# silently fails to start, which is the least debuggable failure mode there is.
+windows-service = "0.7"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",

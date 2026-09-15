@@ -101,9 +101,21 @@ SHIFTED = {
     "%": ("5", True), "^": ("6", True), "&": ("7", True), "*": ("8", True),
     "(": ("9", True), ")": ("0", True), "_": ("minus", True), "+": ("equal", True),
     "{": ("bracket_left", True), "}": ("bracket_right", True), "|": ("backslash", True),
-    ":": ("semicolon", True), '"': ("apostrophe", True), "<": ("comma", True),
+    ":": ("semicolon", True), '"': ("2", True), "<": ("comma", True),
     ">": ("dot", True), "?": ("slash", True), "~": ("grave_accent", True),
 }
+
+# MEASURED on this guest (UK layout): SHIFT+apostrophe -> `@`, SHIFT+2 -> `"`. The UK layout SWAPS
+# these two relative to a US keyboard, so the old map (which said SHIFT+apostrophe for `"`) sent `@`
+# for every double quote.
+#
+# The cost of that: a real command arrived as
+#     sc.exe create wvm-guest binPath= @C:/Program Files/wvm/wvm-guest.exe --bind 0.0.0.0:48273@
+# and sc.exe rejected it as bad syntax. The mangled character is only visible if you read the echo
+# closely — the failure looks like a bad path or a bad option, not like a typing fault.
+#
+# This is the third keymap error from one root cause: the map was written for a US keyboard. The
+# other two were `backslash` yielding `#`, and the held-key reordering in send_key.
 
 # Modifier names, verified against this QEMU by scripts/probe-keynames.sh rather than assumed.
 # The probe rejected `ctrl_l` and `enter`, so the accepted list is meaningful:

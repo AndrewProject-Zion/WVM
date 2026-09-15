@@ -87,10 +87,10 @@ def main(argv):
 
     try:
         if args.command == "hello":
-            request = {"kind": "hello", "client": "talk-to-guest", "protocol_version": 1}
+            request = {"op": "hello", "client": "talk-to-guest", "protocol_version": 1}
 
         elif args.command == "inspect":
-            request = {"kind": "inspect"}
+            request = {"op": "inspect"}
 
         elif args.command == "exec":
             # Everything after the subcommand, split on '--'.
@@ -99,7 +99,7 @@ def main(argv):
                 print("exec needs a program, e.g. exec -- cmd.exe /c echo hi")
                 return 2
             request = {
-                "kind": "exec",
+                "op": "exec",
                 "program": words[0],
                 "args": words[1:],
                 "cwd": None,

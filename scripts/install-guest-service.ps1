@@ -156,16 +156,31 @@ Write-Host "  firewall    inbound TCP $Port allowed from the local subnet only"
 #
 # `sc.exe` rather than New-Service: New-Service cannot set the failure actions, and a control
 # service that stays dead after a crash is a support call.
+#
+# sc.exe's OUTPUT IS KEPT, not piped to Out-Null. An earlier version discarded it and then told the
+# operator to "check the sc.exe output above" — pointing at output that had been thrown away. When
+# registration failed there was nothing to check, and the actual reason (a binPath that sc.exe
+# rejected, for instance) was lost. Capturing it costs nothing and is the difference between a
+# diagnosable failure and a dead end.
 
-$binaryPath = "`"$target`" --bind 0.0.0.0:$Port"
+$binaryPath = "`"$target`" --service"
 
 if ($existing) {
     # Re-point an existing registration rather than trying to create a duplicate.
-    & sc.exe config $serviceName binPath= $binaryPath start= auto | Out-Null
-    Write-Host "  service     reconfigured"
+    $scOutput = & sc.exe config $serviceName binPath= $binaryPath start= auto 2>&1
+    $scExit = $LASTEXITCODE
+    Write-Host "  service     reconfigured (sc.exe exit $scExit)"
 } else {
-    & sc.exe create $serviceName binPath= $binaryPath start= auto DisplayName= "WVM Guest Service" | Out-Null
-    Write-Host "  service     created"
+    $scOutput = & sc.exe create $serviceName binPath= $binaryPath start= auto DisplayName= "WVM Guest Service" 2>&1
+    $scExit = $LASTEXITCODE
+    Write-Host "  service     created (sc.exe exit $scExit)"
+}
+
+# Surface it whenever anything went wrong, and whenever it simply has something to say.
+if ($scExit -ne 0 -or $scOutput) {
+    foreach ($line in $scOutput) {
+        Write-Host "              sc: $line"
+    }
 }
 
 & sc.exe description $serviceName "Executes WVM control requests from the host. See the wvm project." | Out-Null
