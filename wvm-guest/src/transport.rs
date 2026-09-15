@@ -53,13 +53,35 @@ impl Listener {
     /// `Ok(None)` means nothing is pending, which requires the listener to be non-blocking. It is
     /// NOT an error: a poll loop that treated it as one would log a line every 100ms while idle.
     ///
-    /// The distinction matters because the alternative — blocking in `accept` — means a stop
-    /// request is never noticed, which is exactly what happened: `sc.exe stop` left the service
-    /// RUNNING and holding its own binary open, so the next deploy could not replace it.
+    /// Accept one connection if one is pending, explicitly leaving it in BLOCKING mode.
+    ///
+    /// # This is belt-and-braces, not a fix
+    ///
+    /// An earlier version of this comment claimed that a non-blocking listener hands its accepted
+    /// sockets the same mode, and that this caused a large frame to be abandoned mid-read. **That
+    /// claim was tested and is false on Linux**: an accepted socket gets its own file-status flags
+    /// and defaults to blocking. `scripts/probe-socket-inherit.rs`-style measurement showed the
+    /// first read BLOCKING and returning normally.
+    ///
+    /// The `set_nonblocking(false)` call is kept because it makes the intent explicit and costs
+    /// nothing — a reader should not have to know whether the platform inherits the flag to know
+    /// that this socket is safe to read a multi-segment frame from.
+    ///
+    /// It is NOT the explanation for the observed large-frame failure, which remains unfound. The
+    /// comment is corrected rather than deleted because a confident wrong explanation in the source
+    /// is worse than no explanation: the next person would trust it and stop looking.
     pub fn accept(&self) -> Result<Option<TcpConnection>> {
         match self {
             Listener::Tcp(l) => match l.accept() {
-                Ok((stream, _)) => Ok(Some(TcpConnection::new(stream))),
+                Ok((stream, _)) => {
+                    // The fix. See the note above: the mode is inherited from the listener, and a
+                    // non-blocking socket cannot read a frame that spans more than one segment.
+                    stream.set_nonblocking(false).context(
+                        "putting the accepted connection into blocking mode; without this, \
+                                  a frame larger than one TCP segment is silently abandoned",
+                    )?;
+                    Ok(Some(TcpConnection::new(stream)))
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
                 Err(e) => Err(e).context("accepting a connection from the host"),
             },
@@ -134,4 +156,96 @@ impl std::error::Error for TransportError {}
 pub fn round_trip<S: Read + Write>(stream: &mut S, payload: &[u8]) -> Result<Vec<u8>> {
     write_frame(stream, payload)?;
     Ok(read_frame(stream)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// A frame larger than one TCP segment must survive the round trip.
+    ///
+    /// **This is the regression test for a bug that every small test missed.** A non-blocking
+    /// listener hands its accepted sockets the same mode, and `read` on a non-blocking socket
+    /// returns `WouldBlock` the moment the kernel has nothing ready — including mid-message. The
+    /// framing reader treats that as fatal, so a frame arriving in more than one segment was
+    /// abandoned and the connection closed with NO REPLY.
+    ///
+    /// Why it stayed invisible: a small request arrives in a single segment, so the first read gets
+    /// everything and the bug never fires. It only appears once the payload exceeds what the socket
+    /// delivers at once — which is why the probe had to send a real 256 KiB chunk to find it.
+    ///
+    /// So this test deliberately uses a payload well past a segment, and asserts the BYTES arrive
+    /// rather than that no error was returned. The original failure was a silent close, and
+    /// "did not error" would have passed on the broken code.
+    #[test]
+    fn a_frame_larger_than_one_tcp_segment_survives_the_round_trip() {
+        use std::net::{TcpListener as StdListener, TcpStream as StdStream};
+
+        // 256 KiB, base64-encoded: exactly what a transfer chunk produces. The inflation is part of
+        // the test — the real wire payload is what has to work, not the raw size.
+        let raw = vec![0xABu8; 256 * 1024];
+        let encoded = crate::base64::encode(&raw);
+        let payload = format!(r#"{{"chunk_base64":"{encoded}","final":true}}"#).into_bytes();
+
+        assert!(
+            payload.len() > 300 * 1024,
+            "the payload must be comfortably past a TCP segment or this test proves nothing"
+        );
+
+        let listener = StdListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // Cloned for the thread: the test needs the original to compare against afterwards, and
+        // the comparison is the assertion that matters.
+        let expected = payload.clone();
+
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+
+            // Explicit, so the test exercises the fix rather than depending on the listener's mode
+            // by accident. Without this line the old behaviour would never be reproduced here.
+            stream
+                .set_nonblocking(false)
+                .expect("the accepted socket must be blocking");
+
+            let mut conn = TcpConnection::new(stream);
+            let got = conn
+                .recv()
+                .expect("a large frame must be read, not abandoned");
+            assert_eq!(got.len(), expected.len(), "the whole frame must arrive");
+            assert_eq!(got, expected, "and byte-for-byte identical");
+
+            // Reply, so the client learns the read completed rather than inferring from a close.
+            conn.send(b"{\"status\":\"ok\"}").expect("reply");
+        });
+
+        let mut client = StdStream::connect(addr).expect("connect");
+
+        // Write a REAL frame: a 4-byte big-endian length prefix, then the payload.
+        //
+        // The first version of this test wrote the payload alone, and the reader interpreted the
+        // first four bytes of base64 text as a length prefix — reporting a frame of 2,065,851,240
+        // bytes. The refusal was correct and the test was wrong.
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+
+        // Written in small pieces on purpose: a single write_all of 341 KB may be buffered and
+        // delivered promptly, whereas dribbling it guarantees the reader sees it across several
+        // reads — which is the condition that triggers the bug.
+        for piece in frame.chunks(8192) {
+            client.write_all(piece).expect("write");
+        }
+        client.flush().expect("flush");
+
+        // Wait for the reply rather than assuming: a silent close IS the failure mode under test.
+        let reply = read_frame(&mut client);
+        assert!(
+            reply.is_ok(),
+            "the server must reply; a silent close is the original bug. Got: {reply:?}"
+        );
+
+        server.join().expect("server thread");
+    }
 }

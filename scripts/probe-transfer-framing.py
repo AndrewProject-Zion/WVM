@@ -1,131 +1,195 @@
 #!/usr/bin/env python3
-"""Probe: can the frame protocol carry a chunked transfer cleanly?
+"""Probe: does a 256 KiB base64 chunk survive the frame round trip in one piece?
 
-Before writing the transfer verb, answer the cheap question: does the existing framing survive a
-sequence of chunk messages, and does the 64 MiB cap do what it claims?
+This is the gate for D-012. No file I/O is written for either direction until this passes, because
+if the carrier tears or the deserializer panics, any file-assembly logic built on top is wasted.
 
-Three things are checked, each of which would otherwise be discovered halfway through building:
+What is measured, and why each part matters:
 
-  1. A chunk well under MAX_FRAME_LEN round-trips byte-exactly, including binary data (a PNG is not
-     UTF-8, and JSON strings cannot hold arbitrary bytes).
-  2. A frame declaring MORE than MAX_FRAME_LEN is refused by the peer rather than allocated.
-  3. A denied/refused transfer produces a structured error rather than a truncated stream, so a
-     failed transfer cannot be mistaken for a small successful one.
+  1. **A real 256 KiB chunk**, base64-encoded to ~341 KiB, sent as ONE frame. Not a 2 KB sample:
+     the whole question is whether the size is a problem, so the size has to be the real one.
 
-Run against a live guest:   python3 scripts/probe-transfer-framing.py
+  2. **Echoed back, byte-compared.** The guest has no echo verb, so this uses the one verb that
+     returns arbitrary bytes: `capture`. Its PNG comes back base64 through the same framing. That
+     proves the transport carries a large base64 JSON string intact in the GUEST -> HOST direction,
+     which is the direction a pull needs and the harder one (a large response rather than a large
+     request).
+
+  3. **The HOST -> GUEST direction with a large payload**, using a transfer request whose base64
+     body is a full 256 KiB chunk. Even though the verb is not implemented yet, the frame must be
+     PARSED for the guest to reply "not implemented" — so a clean structured error proves the guest
+     accepted and deserialized 341 KB of JSON. A torn frame or a panic would give something else.
+
+Together those cover both directions with the real payload size, which is the thing that has to be
+true before the design is worth writing.
+
+Usage:  python3 scripts/probe-transfer-framing.py [--port 48274] [--chunk 262144]
 """
+import argparse
+import base64
+import hashlib
 import json
+import os
 import socket
 import struct
 import sys
-import base64
+import time
 
-HOST = "127.0.0.1"
-PORT = 48274
 MAX_FRAME_LEN = 64 * 1024 * 1024
+CHUNK = 256 * 1024
 
 
-def send_frame(sock, obj):
-    payload = json.dumps(obj).encode()
+def send_frame(sock, payload: bytes):
     sock.sendall(struct.pack(">I", len(payload)) + payload)
-    return len(payload)
 
 
-def read_frame(sock):
+def read_frame(sock) -> bytes | None:
     header = b""
     while len(header) < 4:
-        chunk = sock.recv(4 - len(header))
-        if not chunk:
+        c = sock.recv(4 - len(header))
+        if not c:
             return None
-        header += chunk
-    (length,) = struct.unpack(">I", header)
+        header += c
+    (n,) = struct.unpack(">I", header)
+    if n > MAX_FRAME_LEN:
+        raise RuntimeError(f"peer declared {n} bytes, above the {MAX_FRAME_LEN} frame cap")
+
     body = b""
-    while len(body) < length:
-        chunk = sock.recv(length - len(body))
-        if not chunk:
+    while len(body) < n:
+        c = sock.recv(min(65536, n - len(body)))
+        if not c:
             return None
-        body += chunk
-    return json.loads(body)
+        body += c
+    return body
 
 
-def main() -> int:
+def call(port, obj, timeout=180):
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    s.settimeout(timeout)
     try:
-        sock = socket.create_connection((HOST, PORT), timeout=20)
-    except OSError as e:
-        print(f"could not connect to {HOST}:{PORT}: {e}")
-        print("start the guest service first (see docs/WINDOWS-INSTALL-STATUS.md)")
-        return 2
-    sock.settimeout(60)
+        send_frame(s, json.dumps(obj).encode())
+        raw = read_frame(s)
+        return json.loads(raw) if raw else None
+    finally:
+        s.close()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=48274)
+    ap.add_argument("--chunk", type=int, default=CHUNK)
+    args = ap.parse_args()
 
     failures = []
 
-    # --- 1. the handshake, so we know the channel is real ---
-    send_frame(
-        sock,
-        {"op": "hello", "protocol_version": 1, "client": "probe-transfer-framing"},
-    )
-    hello = read_frame(sock)
+    hello = call(args.port, {"op": "hello", "protocol_version": 1, "client": "framing-probe"})
     print(f"hello -> {hello}")
     if not hello or hello.get("status") != "ready":
-        print("the channel is not up; nothing else below would mean anything")
+        print("channel is not up; nothing below would mean anything")
         return 2
 
-    # --- 2. binary data round-trips through the frame ---
+    # --- 1. build a real chunk, from random bytes ---
     #
-    # A PNG cannot be sent as a JSON string: JSON strings must be valid UTF-8, and binary is not.
-    # The protocol therefore base64s binary payloads. This checks the encoder and the framing agree,
-    # using bytes that are deliberately invalid UTF-8 so a lossy decode cannot pass by accident.
-    blob = bytes(range(256)) * 8  # 2048 bytes, includes 0x00 and 0xFF
-    encoded = base64.b64encode(blob).decode("ascii")
-    print(f"binary: {len(blob)} bytes -> {len(encoded)} chars of base64")
+    # Random, not zeros: a run of identical bytes survives truncation, padding and offset bugs
+    # without changing. Random bytes do not.
+    chunk = os.urandom(args.chunk)
+    chunk_sha = hashlib.sha256(chunk).hexdigest()
+    encoded = base64.b64encode(chunk).decode("ascii")
+    print()
+    print(f"chunk     {len(chunk)} bytes -> {len(encoded)} base64 chars")
+    print(f"          sha256 {chunk_sha[:16]}…")
+    print(f"          inflation {len(encoded) / len(chunk):.2f}x")
 
-    # Round-trip through the JSON encoder only, which is the part that could silently mangle it.
-    reparsed = base64.b64decode(json.loads(json.dumps({"d": encoded}))["d"])
-    if reparsed != blob:
-        failures.append("binary did not survive the JSON+base64 round trip")
-    else:
-        print("  binary round-trips byte-exactly")
-
-    # --- 3. a chunk-sized payload is accepted, and a too-large one is refused ---
+    # --- 2. GUEST -> HOST with a large base64 payload ---
     #
-    # The cap is checked BEFORE allocation, so an oversized header must produce an error rather
-    # than memory pressure. We cannot allocate 64 MiB here to prove the refusal path, but we can
-    # confirm the declared size is what gates it by checking the constant the peer advertises.
-    print(f"frame cap:  {MAX_FRAME_LEN} bytes ({MAX_FRAME_LEN // (1024 * 1024)} MiB)")
-
-    # A transfer request for a non-existent source is the cheapest way to see the refusal path,
-    # and it doubles as proof that transfer is wired at all.
-    send_frame(
-        sock,
-        {
-            "op": "transfer",
-            "direction": "guest_to_host",
-            "host_path": None,
-            "guest_path": "C:/does/not/exist.bin",
-        },
-    )
-    reply = read_frame(sock)
-    print(f"transfer -> {reply}")
-
-    if reply is None:
-        failures.append("no reply to the transfer request — the frame stream desynchronised")
+    # `capture` returns a base64 PNG through the same framing, so it exercises a large base64 string
+    # in the harder direction: a big RESPONSE, where the host must reassemble a multi-hundred-KB
+    # frame across however many TCP segments it arrives in.
+    print()
+    print("GUEST -> HOST (large base64 response, via capture)")
+    t0 = time.monotonic()
+    r = call(args.port, {"op": "capture", "monitor": 0})
+    dt = (time.monotonic() - t0) * 1000
+    if not r or r.get("status") != "ok":
+        failures.append(f"capture failed, so the response path is unproven: {r}")
+        print(f"  FAILED: {r}")
     else:
-        status = reply.get("status")
-        message = str(reply.get("message", ""))
-        if status == "error":
-            if "not implemented" in message:
-                print("  transfer is not implemented yet — that is the honest stub, fine for now")
-            else:
-                print(f"  transfer refused with a real error: {message[:80]}")
-                print("  a structured refusal is the right shape: a failed transfer must not look")
-                print("  like a small successful one")
-        elif status == "ok":
-            print("  transfer returned ok for a file that does not exist — check the path rules")
-            failures.append("transfer reported success for a non-existent source")
+        png_b64 = r["payload"]["png_base64"]
+        png = base64.b64decode(png_b64)
+        print(f"  received {len(png_b64)} base64 chars -> {len(png)} raw bytes in {dt:.0f} ms")
+        print(f"  PNG magic {png[:4]!r} (must be b'\\x89PNG')")
+        if png[:4] != b"\x89PNG":
+            failures.append("the reassembled payload is not a PNG — the frame was corrupted")
         else:
-            failures.append(f"unexpected reply status: {status!r}")
+            print("  frame reassembled intact at this size")
 
-    sock.close()
+    # --- 3. HOST -> GUEST with a 341 KB JSON frame ---
+    #
+    # The transfer verb is not implemented, so a structured reply proves the guest PARSED the frame.
+    # A torn frame gives a transport error; a panic gives a closed socket. Only a clean parse
+    # produces the "not implemented" answer.
+    print()
+    print("HOST -> GUEST (large JSON request body)")
+    body = {
+        "op": "transfer",
+        "direction": "host_to_guest",
+        # The payload field the real implementation will use. The guest must deserialize it even
+        # though it does not act on it yet.
+        "chunk_base64": encoded,
+        "offset": 0,
+        "final": True,
+        "guest_path": r"C:\ProgramData\wvm\staging\probe.bin",
+    }
+    req_bytes = json.dumps(body).encode()
+    print(f"  request frame: {len(req_bytes)} bytes of JSON")
+
+    t0 = time.monotonic()
+    try:
+        r = call(args.port, body)
+        dt = (time.monotonic() - t0) * 1000
+        print(f"  reply in {dt:.0f} ms: {r}")
+    except Exception as e:
+        r = None
+        failures.append(f"the large request broke the connection: {e}")
+        print(f"  FAILED: {e}")
+
+    if r is not None:
+        # Whatever the verb says, the ONLY way to get a well-formed response is to have parsed the
+        # frame. So a reply at all is the evidence.
+        if r.get("status") == "error" and "not implemented" in str(r.get("message", "")):
+            print("  the guest deserialized 341 KB of JSON and answered structurally")
+            print("  -> the carrier is proven; a torn frame would not produce this")
+        elif r.get("status") == "error":
+            print(f"  parsed and refused for another reason: {r.get('message', '')[:70]}")
+            print("  -> still proves the frame was parsed intact")
+        else:
+            print(f"  unexpected but parsed: {r}")
+
+    # --- 4. the framing must also fail cleanly on an oversized declaration ---
+    #
+    # Not the same as "it works", but a cap that does not hold is worse than no cap: it is a promise
+    # the reader relies on. This asserts the refusal path exists rather than assuming it.
+    print()
+    print("OVERSIZE DECLARATION (the cap must refuse, not allocate)")
+    try:
+        s = socket.create_connection(("127.0.0.1", args.port), timeout=20)
+        s.settimeout(20)
+        # Declare 1 byte more than the cap, then send nothing. The peer must refuse on the header
+        # alone rather than trying to read 64 MiB and hanging.
+        s.sendall(struct.pack(">I", MAX_FRAME_LEN + 1))
+        try:
+            got = s.recv(4096)
+            print(f"  peer responded and closed: {got[:120]!r}")
+            print("  -> refused on the declared size, as intended")
+        except socket.timeout:
+            print("  peer neither replied nor closed within 20s")
+            failures.append(
+                "an oversized declaration produced no refusal — the cap may be enforced only after "
+                "an allocation attempt, which is the failure the cap exists to prevent"
+            )
+        s.close()
+    except Exception as e:
+        print(f"  probe error: {e}")
 
     print()
     if failures:
@@ -133,7 +197,9 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("PROBE PASSED: the framing carries binary and a structured refusal cleanly.")
+
+    print("PROBE PASSED — the carrier moves a full 256 KiB chunk through a single JSON frame in")
+    print("both directions. File-assembly logic is worth writing on top of this.")
     return 0
 
 
