@@ -384,3 +384,67 @@ lookup table's clothes. The tests assert the mapping, but only a live guest conf
 layout is still UK.
 
 ---
+
+## D-012 — Bulk bytes travel as base64 chunks inside JSON, in lockstep
+
+**Date:** 2026-09-15
+**Status:** accepted (push verified live; pull built, not yet verified)
+
+**Context.** A transfer has the host as the reader for a push and the guest as the reader for a pull,
+and there is no shared filesystem between them by design — the original project mounted host `/` into
+the guest as a writable `Z:\` and this project exists partly to avoid that. So the bytes must travel
+over the protocol.
+
+**Decision, carrier.** Base64 inside JSON, **256 KiB of binary per chunk** (~341 KiB on the wire).
+The 33% inflation is a non-argument at this size, and the property that matters was measured before
+anything was built on it: a 341 KiB frame round-trips intact, reproducibly, five times out of five
+(`scripts/probe-frame-size.py`, `wvm-ipc`'s `a_transfer_sized_frame_round_trips`).
+
+**Alternatives rejected.**
+
+- **Multiplexed binary frames** (a 1-byte type header before the length prefix). Zero inflation and
+  more speed. Rejected because it needs a hand-written parser in the Rust host, the Rust guest *and*
+  the Python reference client — and three implementations of one framing rule is where desync bugs
+  live. `examples/wvm_client.py` gaining five lines instead of a state machine is the whole argument.
+- **A side-channel data socket.** Rejected immediately: a second ephemeral port per transfer breaks
+  the single-port boundary and widens the firewall surface for a control plane. Called out in the
+  research as a discard.
+
+**Decision, pacing.** Lockstep, one chunk per round trip:
+
+```
+host: read 256 KiB -> base64 -> send -> WAIT -> verify the byte count -> next
+```
+
+Not an optimisation. The host reads from a bare-metal disk and base64-encodes far faster than the
+guest can deserialize JSON, decode base64, and flush through virtio-blk to a virtualised NTFS volume.
+Streaming ahead fills the TCP buffers and then the guest's receive queue, and the failure is an
+out-of-memory kill or a torn socket rather than anything legible. Round-tripping per chunk makes
+network speed into disk speed and keeps memory flat at any file size.
+
+**Decision, the offset is on every chunk.** The obvious design is append-in-arrival-order. It would
+let a gap or an overlap produce a file of the **right length with the wrong contents** — and an
+end-of-transfer length check cannot catch that, because by then the bytes are on disk and the count is
+correct. Only a hash comparison would notice, after rewriting gigabytes to find out where it went
+wrong. Naming the offset per chunk turns that into a loud error on the chunk that caused it.
+
+**Decision, `Transfer` and the chunk verbs are separate.** `Transfer` names *what* is moving and opens
+the destination or source; `TransferChunk` / `PullChunk` carry or request the bytes. Splitting them
+means the guest validates a path once and then writes or reads chunks without re-resolving a path it
+has already checked.
+
+**Decision, the two directions are asymmetric code, not one mirrored function.** An earlier version of
+`transfer::plan` treated push and pull as one operation, and that assumption hid a bug: it validated
+the host's path against a root the guest cannot see, so every honest transfer was refused with a
+correct-looking error. A pull has no host path at all, and a design that assumes symmetry cannot
+express that.
+
+**Consequence, and an open hole this work surfaced.** The guest answers one request at a time, so any
+single request that blocks holds the entire control channel. `exec` defaulted to a **ten-minute**
+timeout and the protocol did not expose it, so a hung command presented as a dead service rather than
+a slow one — the host's own read timeout fires first. `timeout_ms` is now on `Exec` and the caller
+decides. The general problem is not solved: a request that ignores its timeout would still hold the
+channel, and a future revision should consider a watchdog that can abandon a request without killing
+the service.
+
+---

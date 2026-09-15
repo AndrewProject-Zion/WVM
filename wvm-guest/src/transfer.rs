@@ -107,11 +107,15 @@ pub fn plan(
     // The guest path is this side's responsibility: resolved and contained against the staging root.
     let resolved_guest = paths::resolve_within(guest_root, guest_path)?;
 
-    // The host path is recorded, not validated. See the note above — the host owns that check.
-    if host_path.trim().is_empty() {
-        bail!("refusing transfer: empty host path");
-    }
-
+    // The host path is recorded when there is one, and not validated here.
+    //
+    // A pull legitimately has NO host path: the guest is the source and the host's destination is
+    // its own business, on a filesystem the guest cannot see. Requiring one would make every pull
+    // fail with "empty host path", which is exactly what happened on the first live run.
+    //
+    // For a push the host path is the file the host will read. It is still not validated here,
+    // because the guest has no view of the host's filesystem — the host applies its own containment
+    // before sending. See the note at the top.
     let _ = host_root;
 
     if guest_path.trim().is_empty() {
@@ -368,17 +372,21 @@ mod tests {
         .expect("the guest must not reject a host path it cannot evaluate");
         assert_eq!(ok.host_path, "/etc/passwd");
 
-        // What the guest DOES still refuse: an empty host path, because a transfer with no
-        // destination on the other side is not a request that can be carried out.
-        let err = plan(
+        // A pull legitimately has NO host path, because the guest is the source and the host's
+        // destination is on a filesystem the guest cannot see. This must be PLANNED, not refused.
+        //
+        // The earlier version of this test asserted the opposite, and the rule it encoded made every
+        // pull fail with "empty host path" on the first live run — a refusal that looked like a
+        // boundary working and was really a boundary applied where it has no meaning.
+        let pull = plan(
             Direction::GuestToHost,
             GUEST_ROOT,
             HOST_ROOT,
             "C:\\wvm\\file.txt",
             "",
         )
-        .expect_err("an empty host path must be refused");
-        assert!(err.to_string().contains("empty host path"));
+        .expect("a pull has no host path and must still plan");
+        assert_eq!(pull.host_path, "");
     }
 
     #[test]

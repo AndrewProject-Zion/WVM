@@ -17,6 +17,7 @@ mod image;
 mod input;
 mod journal;
 mod policy;
+mod pull;
 mod push;
 mod server;
 mod supervisor;
@@ -164,9 +165,16 @@ enum VmAction {
         action: String,
 
         /// The file to move.
+        ///
+        /// For `push` this is a host path. For `pull` it is a **guest** path — the file being
+        /// fetched. The name is unhelpful for pull, which is why `--help` spells out both cases
+        /// rather than relying on the argument name to carry the meaning.
         source: std::path::PathBuf,
 
-        /// Where to put it, inside the guest's staging root.
+        /// Where to put it.
+        ///
+        /// For `push` this is a **guest** path, inside the guest's staging root. For `pull` it is a
+        /// **host** destination.
         guest_path: String,
 
         /// Replace an existing file at the destination.
@@ -524,12 +532,35 @@ fn run_vm(action: VmAction) -> Result<()> {
                     }
                     Ok(())
                 }
-                "pull" => anyhow::bail!(
-                    "pull is not implemented yet: a push needs the host to be the READER, and a pull \
-                     needs the host to be the WRITER. The carrier is proven and the chunk framing is \
-                     shared, so this is the same loop with the roles swapped — but it is not \
-                     written, and pretending otherwise would be worse than saying so."
-                ),
+                "pull" => {
+                    // Lockstep in the other direction: ask for a chunk, write it, ask again. The
+                    // guest is the reader here, which is why this is its own module rather than the
+                    // push loop with the arguments swapped — see `pull.rs`.
+                    //
+                    // NOTE the argument order. `source` and `guest_path` are named for a push, and
+                    // for a pull their meaning inverts: `source` is the GUEST file being fetched and
+                    // `guest_path` is the HOST destination. Getting this backwards sends the local
+                    // path to the guest, which refuses it as outside its staging root — a confusing
+                    // error that looks like a boundary problem rather than a swapped argument.
+                    let guest_source = source.to_string_lossy().to_string();
+                    let host_destination = std::path::PathBuf::from(&guest_path);
+
+                    let started = std::time::Instant::now();
+                    let pulled = pull::pull(&addr, &guest_source, &host_destination, overwrite)?;
+                    let elapsed = started.elapsed();
+
+                    println!(
+                        "pulled {} bytes in {} chunk(s) from {}",
+                        pulled.bytes, pulled.chunks, guest_source
+                    );
+                    println!("  written to {}", pulled.host_path);
+                    println!(
+                        "  {:.1} ms total, {:.0} KiB/s effective",
+                        elapsed.as_secs_f64() * 1000.0,
+                        (pulled.bytes as f64 / 1024.0) / elapsed.as_secs_f64().max(0.001)
+                    );
+                    Ok(())
+                }
                 other => anyhow::bail!("unknown transfer action '{other}' (expected push or pull)"),
             }
         }

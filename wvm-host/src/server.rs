@@ -275,6 +275,12 @@ impl Server {
                 }
                 policy::check_guest_path(grant, guest_path)
             }
+            Request::PullChunk { .. } => {
+                // No path here either. The source was named and contained by the opening `Transfer`,
+                // and this reads only from what that established — so authorising by verb alone is
+                // correct rather than a shortcut.
+                Ok(())
+            }
             Request::TransferChunk { .. } => {
                 // A chunk carries no path. The destination was named and checked by the opening
                 // `Transfer`, and this writes only where that established. Authorising it by verb
@@ -328,6 +334,7 @@ impl Server {
             Request::Input { .. } => no_guest("input"),
             Request::Transfer { .. } => no_guest("transfer"),
             Request::TransferChunk { .. } => no_guest("transfer chunk"),
+            Request::PullChunk { .. } => no_guest("pull chunk"),
             Request::Lifecycle { .. } => no_guest("lifecycle"),
         }
     }
@@ -356,6 +363,7 @@ fn op_name(request: &Request) -> &'static str {
         Request::Capture { .. } => "capture",
         Request::Input { .. } => "input",
         Request::TransferChunk { .. } => "transfer_chunk",
+        Request::PullChunk { .. } => "pull_chunk",
         Request::Transfer { .. } => "transfer",
         Request::Lifecycle { .. } => "lifecycle",
     }
@@ -377,6 +385,7 @@ fn payload_name(payload: &Payload) -> &'static str {
         Payload::ProcessOutput { .. } => "process_output",
         Payload::Frame { .. } => "frame",
         Payload::ChunkWritten { .. } => "chunk_written",
+        Payload::ChunkRead { .. } => "chunk_read",
         Payload::Transferred { .. } => "transferred",
         Payload::LifecycleDone { .. } => "lifecycle_done",
     }
@@ -584,6 +593,7 @@ mod tests {
                 args: vec![],
                 cwd: None,
                 require_allowlist: true,
+                timeout_ms: None,
             },
         );
         match response {
@@ -605,6 +615,7 @@ mod tests {
                 args: vec![],
                 cwd: None,
                 require_allowlist: true,
+                timeout_ms: None,
             },
         );
         match response {
@@ -704,6 +715,7 @@ mod tests {
                 args: vec![],
                 cwd: None,
                 require_allowlist: false,
+                timeout_ms: None,
             }
         )
         .is_err());
@@ -725,6 +737,7 @@ mod tests {
             args: vec![],
             cwd: None,
             require_allowlist: false,
+            timeout_ms: None,
         };
         let response = c.send(&smuggled).unwrap();
         drop(c);
@@ -776,6 +789,7 @@ mod tests {
                 args: vec![],
                 cwd: None,
                 require_allowlist: true,
+                timeout_ms: None,
             })
             .unwrap();
         assert!(matches!(response, Response::Error { .. }));

@@ -124,6 +124,19 @@ pub enum Request {
         /// Whether `program` must appear in the host's allowlist before dispatch.
         #[serde(default)]
         require_allowlist: bool,
+        /// How long the process may run before it is killed, in milliseconds.
+        ///
+        /// `None` means the guest's default, which is **ten minutes**. That default is a real
+        /// problem for a caller that does not think about it, and it was found the hard way: the
+        /// guest answers ONE request at a time, so a single command that hangs holds the entire
+        /// control channel for ten minutes. The host's own read timeout fires first, and the
+        /// symptom is "the guest accepted the connection but did not answer" — which reads like a
+        /// dead service, not like a slow command.
+        ///
+        /// So the caller states what it is willing to wait for. A short timeout turns a hung command
+        /// into a `timed_out` reply the host can act on, instead of an unexplained silence.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
     },
 
     /// Capture the guest framebuffer as PNG. Exercises [`Verb::Capture`].
@@ -183,6 +196,23 @@ pub enum Request {
         /// dies leaves the receiver unable to distinguish "complete" from "truncated" without a
         /// timeout. An explicit end marker cannot be ambiguous.
         eof: bool,
+    },
+
+    /// Request one chunk of a file the guest is serving.
+    ///
+    /// The mirror of `TransferChunk`, and deliberately a separate verb rather than a direction flag
+    /// on it. The two carry different things: a push chunk carries DATA, and this carries a REQUEST
+    /// for data. Overloading one verb would mean a variant whose payload fields are half-unused
+    /// depending on direction, which is how a reader ends up misreading which side is which.
+    ///
+    /// `offset` and `length` are named rather than implied. A "send me the next chunk" protocol
+    /// would need the guest to remember how far it had served, and a retry after a lost reply would
+    /// then serve the wrong bytes. A self-describing request makes a replay harmless.
+    PullChunk {
+        /// Byte offset to read from.
+        offset: u64,
+        /// Maximum bytes wanted. The guest returns fewer at the end of the file, never more.
+        length: u64,
     },
 
     /// VM lifecycle. Exercises [`Verb::Lifecycle`].
@@ -271,7 +301,9 @@ impl Request {
             Request::Exec { .. } => Verb::Exec,
             Request::Capture { .. } => Verb::Capture,
             Request::Input { .. } => Verb::Input,
-            Request::Transfer { .. } | Request::TransferChunk { .. } => Verb::Transfer,
+            Request::Transfer { .. }
+            | Request::TransferChunk { .. }
+            | Request::PullChunk { .. } => Verb::Transfer,
             Request::Lifecycle { .. } => Verb::Lifecycle,
         }
     }
@@ -290,6 +322,8 @@ pub enum RequestKind {
         args: Vec<String>,
         cwd: Option<String>,
         require_allowlist: bool,
+        /// How long the process may run, or `None` for the guest's default.
+        timeout_ms: Option<u64>,
     },
     Capture {
         monitor: u8,
@@ -333,11 +367,13 @@ impl RequestKind {
                 args,
                 cwd,
                 require_allowlist,
+                timeout_ms,
             } => Request::Exec {
                 program,
                 args,
                 cwd,
                 require_allowlist,
+                timeout_ms,
             },
             RequestKind::Capture { monitor } => Request::Capture { monitor },
             RequestKind::Input { event } => Request::Input { event },
@@ -484,6 +520,20 @@ pub enum Payload {
         /// Echoed end-of-file flag.
         eof: bool,
     },
+    /// One chunk of a file the guest served, plus enough to reconstruct the whole.
+    ///
+    /// Carries the running `total` so the receiver can confirm it got what the file actually is,
+    /// rather than discovering a truncated read only from a hash mismatch at the end.
+    ChunkRead {
+        /// The offset this chunk begins at, echoed so a reply can be matched to its request.
+        offset: u64,
+        /// The chunk's bytes, base64-encoded — JSON strings cannot carry arbitrary binary.
+        data_base64: String,
+        /// True when this chunk reaches the end of the file.
+        eof: bool,
+        /// Total size of the file being served, so the caller can check its own accounting.
+        total: u64,
+    },
     /// Lifecycle acknowledgement.
     LifecycleDone {
         action: LifecycleAction,
@@ -533,6 +583,66 @@ pub fn base64_encode_for_test(data: &[u8]) -> String {
     out
 }
 
+/// Standard base64 decoding, for payloads that arrive from a peer.
+///
+/// Strict about the alphabet and the padding, deliberately. Input arrives from the network, and a
+/// lenient decoder is how malformed data becomes silently wrong data: a byte dropped by a lenient
+/// skip would shift everything after it and the file would still look plausibly sized.
+pub fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
+    fn value(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let bytes = text.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err(format!("length {} is not a multiple of 4", bytes.len()));
+    }
+
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (i, group) in bytes.chunks(4).enumerate() {
+        let mut vals = [0u8; 4];
+        let mut pad = 0;
+        for (j, &c) in group.iter().enumerate() {
+            if c == b'=' {
+                // Padding is only legal in the last group, and only in the last two positions.
+                if i != bytes.len() / 4 - 1 || j < 2 {
+                    return Err("padding in an invalid position".into());
+                }
+                pad += 1;
+                vals[j] = 0;
+            } else {
+                // A non-padding character AFTER padding is malformed.
+                if pad > 0 {
+                    return Err("data after padding".into());
+                }
+                vals[j] = value(c).ok_or_else(|| format!("invalid base64 character {c:?}"))?;
+            }
+        }
+
+        let n = (u32::from(vals[0]) << 18)
+            | (u32::from(vals[1]) << 12)
+            | (u32::from(vals[2]) << 6)
+            | u32::from(vals[3]);
+
+        out.push((n >> 16) as u8);
+        if pad < 2 {
+            out.push((n >> 8) as u8);
+        }
+        if pad < 1 {
+            out.push(n as u8);
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +689,7 @@ mod tests {
                 args: vec![],
                 cwd: None,
                 require_allowlist: true,
+                timeout_ms: None,
             },
         )
         .expect_err("deny_all must refuse Exec");
@@ -604,6 +715,7 @@ mod tests {
                 args: vec![],
                 cwd: None,
                 require_allowlist: false,
+                timeout_ms: None,
             },
             RequestKind::Capture { monitor: 0 },
             RequestKind::Input {
@@ -636,6 +748,7 @@ mod tests {
                 args: vec!["/c".into(), "echo hi".into()],
                 cwd: Some("C:\\wvm".into()),
                 require_allowlist: true,
+                timeout_ms: None,
             },
         )
         .unwrap();

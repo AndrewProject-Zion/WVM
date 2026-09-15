@@ -105,6 +105,7 @@ pub fn handle(request: &Request) -> Response {
             program,
             args,
             cwd,
+            timeout_ms,
             require_allowlist: _,
         } => {
             // `require_allowlist` is carried to the host, not acted on here. The guest does not
@@ -114,7 +115,11 @@ pub fn handle(request: &Request) -> Response {
                 program,
                 args,
                 cwd.as_deref(),
-                crate::win32::DEFAULT_TIMEOUT_MS,
+                // The caller decides how long it will wait. The guest's ten-minute default is a
+                // trap: it answers ONE request at a time, so an unqualified `exec` that hangs
+                // holds the whole control channel for ten minutes while the host's own read
+                // timeout fires first — presenting as a dead service rather than a slow command.
+                timeout_ms.unwrap_or(crate::win32::DEFAULT_TIMEOUT_MS),
             ) {
                 Ok(execution) => {
                     let (outcome, code) = match execution.outcome {
@@ -196,19 +201,48 @@ pub fn handle(request: &Request) -> Response {
 
             #[cfg(windows)]
             {
-                match crate::chunk::begin(&plan.guest_path, *overwrite) {
-                    Ok(dest) => Response::Ok {
-                        payload: Payload::Transferred {
-                            // Zero: this acknowledges the destination, not a transfer. The byte
-                            // count arrives with the chunks.
-                            bytes: dest.expected_bytes,
-                            direction: plan.direction.to_string(),
-                            guest_path: plan.guest_path.clone(),
-                        },
-                    },
-                    Err(e) => Response::Error {
-                        message: format!("transfer: {e}"),
-                    },
+                // The two directions are genuinely different operations, not one mirrored call.
+                //
+                // A push opens a DESTINATION to write into; a pull opens a SOURCE to read from.
+                // Treating them as one operation is what previously hid a bug: `plan` checked a
+                // host path the guest cannot see, and every honest transfer was refused. Branching
+                // here states the asymmetry rather than papering over it.
+                match direction {
+                    wvm_ipc::TransferDirection::HostToGuest => {
+                        match crate::chunk::begin(&plan.guest_path, *overwrite) {
+                            Ok(dest) => Response::Ok {
+                                payload: Payload::Transferred {
+                                    // Zero: this acknowledges the destination, not a transfer. The
+                                    // byte count arrives with the chunks.
+                                    bytes: dest.expected_bytes,
+                                    direction: plan.direction.to_string(),
+                                    guest_path: plan.guest_path.clone(),
+                                },
+                            },
+                            Err(e) => Response::Error {
+                                message: format!("transfer: {e}"),
+                            },
+                        }
+                    }
+                    wvm_ipc::TransferDirection::GuestToHost => {
+                        match crate::pull::begin_source(
+                            &plan.guest_path,
+                            crate::pull::MAX_PULL_BYTES,
+                        ) {
+                            Ok(src) => Response::Ok {
+                                payload: Payload::Transferred {
+                                    // The size the caller is about to receive, so it can allocate
+                                    // its own accounting before asking for the first chunk.
+                                    bytes: src.size,
+                                    direction: plan.direction.to_string(),
+                                    guest_path: plan.guest_path.clone(),
+                                },
+                            },
+                            Err(e) => Response::Error {
+                                message: format!("transfer: {e}"),
+                            },
+                        }
+                    }
                 }
             }
 
@@ -264,6 +298,51 @@ pub fn handle(request: &Request) -> Response {
                     message: "transfer chunk: the filesystem layer is only present in a Windows \
                               build of wvm-guest; this binary was built for the host, where it \
                               exists to be type-checked and tested rather than run"
+                        .to_string(),
+                }
+            }
+        }
+
+        Request::PullChunk { offset, length } => {
+            // Serve one chunk of a file the guest opened on `Transfer`. The offset and length come
+            // from the caller, so a replayed request produces the same bytes and a lost reply is
+            // harmless to retry.
+            #[cfg(windows)]
+            {
+                // The path comes from the pull that is already open — a chunk carries no path, by
+                // design: naming the file per chunk would be redundant bytes and one more place for
+                // the two sides to disagree.
+                let open_path = match crate::pull::only_open_source() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!("pull chunk: {e}"),
+                        };
+                    }
+                };
+
+                match crate::pull::read_chunk(&open_path, *offset, *length) {
+                    Ok((data, eof, total)) => Response::Ok {
+                        payload: Payload::ChunkRead {
+                            offset: *offset,
+                            data_base64: crate::base64::encode(&data),
+                            eof,
+                            total,
+                        },
+                    },
+                    Err(e) => Response::Error {
+                        message: format!("pull chunk: {e}"),
+                    },
+                }
+            }
+
+            #[cfg(not(windows))]
+            {
+                let _ = (offset, length);
+                Response::Error {
+                    message: "pull chunk: the filesystem layer is only present in a Windows build \
+                              of wvm-guest; this binary was built for the host, where it exists to \
+                              be type-checked and tested rather than run"
                         .to_string(),
                 }
             }
@@ -471,6 +550,7 @@ mod tests {
             args: vec!["/c".into(), "echo".into(), "hi".into()],
             cwd: None,
             require_allowlist: true,
+            timeout_ms: None,
         };
 
         match handle(&req) {
@@ -523,6 +603,7 @@ mod tests {
             args: vec![],
             cwd: None,
             require_allowlist: false,
+            timeout_ms: None,
         };
         assert!(validate(&req).is_err());
     }
