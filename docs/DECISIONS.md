@@ -256,3 +256,131 @@ abliteration budget are the family). **A check whose failure mode cannot be told
 success mode is not a check — it is a coin that always lands heads.**
 
 ---
+
+## D-009 — Capture runs on the host against the framebuffer, not inside the guest
+
+**Date:** 2026-09-15
+**Status:** accepted
+
+**Context.** Capture was implemented first inside the guest, via Win32 GDI (`GetDC`, `BitBlt`,
+`GetDIBits`), returning a PNG base64-encoded through the typed protocol. This was the natural
+choice: it goes through the same grant check and journal as every other operation, and it was
+written and tested (a full PNG encoder with CRC and Adler-32, plus a base64 codec).
+
+Against the live guest it failed at `BitBlt`:
+
+```
+capture: BitBlt failed (error 6)
+```
+
+**Finding.** The service runs in **session 0**. Measured in the guest:
+
+```
+SESSIONNAME   USERNAME    ID  STATE
+>services                  0  Disc
+ console      zion-win     1  Active
+```
+
+The user's desktop is session 1. Session 0 is isolated and has no desktop to copy from — this is a
+deliberate Windows security boundary dating from Vista, and `BitBlt` from session 0 is supposed to
+fail. It cannot be worked around: reaching the interactive desktop requires
+`WTSQueryUserToken` + `CreateProcessAsUser` with `lpDesktop = "winsta0\default"` and
+`SE_TCB_NAME`, i.e. a privilege-elevating process spawned into session 1 per request.
+
+**Decision.** Capture runs on the **host**, issuing QMP `screendump` and converting the PPM to PNG
+in `wvm-host/src/image.rs`. The operation still passes through the capability boundary and the
+journal, which was the actual point of routing it through the protocol — the pixels are simply
+taken from the framebuffer that QEMU owns rather than from a session that structurally cannot see
+the desktop.
+
+**Alternatives rejected.**
+
+- `CreateProcessAsUser` into session 1 (~200 lines of Win32, `SeTcbPrivilege`, a process spawned per
+  request). Correct, and the right answer if a *hostile guest* ever needs to be prevented from
+  misreporting its own screen. Not warranted for a tool driving a VM the operator already controls,
+  and it is a large amount of privilege-moving code to maintain.
+- Running the service as a session-1 logon task. Gives it a desktop, and gives up SCM-managed
+  auto-restart and service lifecycle — trading a real property for a cosmetic one.
+
+**Consequence.** `capture.rs` and `base64.rs` in the guest are **kept**: they are correct, tested,
+and exactly what the session-1 variant needs if that is ever built. They are not wired into
+dispatch, and the dead-code allowance on them records why.
+
+**A guest with no display cannot be captured at all.** That is inherent to reading the framebuffer,
+and it is honest: a black image from a headless guest would be indistinguishable from a dark screen,
+which is the same silent-failure shape this project keeps recording.
+
+---
+
+## D-010 — Input goes through emulated hardware, and the pointer is absolute
+
+**Date:** 2026-09-15
+**Status:** accepted
+
+**Context.** Input was expected to need the same `CreateProcessAsUser` machinery as D-009, since a
+session-0 service cannot call `SendInput` into session 1.
+
+**Finding.** Session 0 isolation applies to the **Windows input API**, not to **emulated hardware**.
+QMP input arrives as PS/2 and USB device events, which the kernel delivers to whichever session owns
+the active console — session 1. No Windows API is involved, so the isolation boundary never applies.
+
+The evidence was already in the repository: the entire Windows installation had been driven by QMP
+keyboard injection, with no guest-side component. Checking that before writing code avoided a second
+large piece of privilege-elevating Win32.
+
+**Decision.** Input is issued from the host via QMP, through `wvm vm input`.
+
+Two supporting decisions:
+
+- **A `usb-tablet` is attached, on a `qemu-xhci` controller declared before it.** Without an
+  absolute pointing device QEMU exposes only a relative mouse, whose deltas accumulate — a
+  coordinate cannot be expressed at all. `qemu-xhci` is required on q35, which provides no USB bus
+  by default, and the device must name its bus (`bus=xhci0.0`).
+- **The keymap is UK and verified by typing into the guest, not derived.** Keycodes are physical
+  positions, so what they produce depends on the guest's layout. Three entries were wrong and each
+  produced a symptom that looked like a different fault entirely (see D-011).
+
+**Consequence.** Input requires QEMU to be running, like capture, and cannot be used with a guest
+whose display device is absent. A backslash is **refused** rather than mapped to its nearest
+neighbour, with the workaround named, because silently substituting `#` is what turned a correct
+path into `E:#NetKVM#w11#...` and sent a debugging session in the wrong direction.
+
+---
+
+## D-011 — Measure the keymap by typing into the guest; never derive it from the host's layout
+
+**Date:** 2026-09-15
+**Status:** accepted
+
+**Context.** Three separate bugs across two sessions, all one root cause: the input map was written
+for a US keyboard on a guest configured UK.
+
+| Intended | Was mapped to | Produced | Presented as |
+|---|---|---|---|
+| `"` | SHIFT + apostrophe | `@` | `sc.exe` rejecting its own quoting — misread as a bad path or permissions |
+| `\` | `backslash` | `#` | `pnputil` reporting a missing driver for a mangled path |
+| `@` | SHIFT + 2 | `"` | swapped with `"`, since UK and US differ on both |
+
+A fourth, separate fault looked like a fifth: `send-key` with `hold-time: 60` left every key held
+while the next arrived, so the guest's driver **reordered** characters. At 90+ characters, stray
+characters appeared at the *start* of the line, which read as a line-length limit. It was
+disproved by measuring — 110 characters arrived intact once explicit press/release events replaced
+the held keys, where 90 had been mangled before.
+
+**Decision.** Every entry in `wvm-host/src/input.rs` is verified by **typing into the guest and
+reading the echo back**. The map is a measurement, not a derivation, and each entry that was once
+wrong carries a comment naming the symptom it caused.
+
+Two rules fall out of it:
+
+1. **Never derive a keymap from the host's layout.** The host's layout is irrelevant; the guest's is
+   the only one that matters, and they can differ silently.
+2. **Refuse what cannot be produced rather than substituting.** No keycode yields a literal
+   backslash on a UK layout. Mapping it to `backslash` (which yields `#`) is how a correct path
+   became a mangled one, and the resulting error named the wrong problem entirely.
+
+**Consequence.** Adding a character to the map without typing it into a guest is a guess wearing a
+lookup table's clothes. The tests assert the mapping, but only a live guest confirms the guest's
+layout is still UK.
+
+---

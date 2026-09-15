@@ -171,7 +171,7 @@ one. See `docs/VM-CONFIG.md`.
 - [x] Verify the guest can reach the host over the forwarded port
 - [x] Process launch with stdout/stderr capture and exit code
 - [x] Wire the transport, paths and transfer modules into `dispatch`
-- [ ] Input injection and framebuffer capture  ← M5
+- [x] Input injection and framebuffer capture  ← done in M5
 
 **Verified end to end**, driven from Linux with no console and no keyboard:
 
@@ -225,14 +225,49 @@ real frames.
 See `docs/WINDOWS-INSTALL-STATUS.md` for what is installed in the guest and how to drive it.
 
 
-## M5 — Agent surface
+## M5 — Agent surface  ← IN PROGRESS
 
 - [x] Reference client (`examples/wvm_client.py`, dependency-free, stdlib only)
 - [x] Capability boundary demonstrable (`wvm_client.py boundary`, exits non-zero on a leak)
+- [x] `capture` — PNG of the live desktop, from the host framebuffer (D-009)
+- [x] `input` — absolute pointer moves and clicks, UK-correct keys and text (D-010, D-011)
+- [x] WVM-01 fixed — execution pipes drained concurrently, not after exit
+- [ ] `transfer` — move files between host and guest
+- [ ] `lifecycle` — snapshot and restore
 - [ ] Stable request/response contract documented as a standalone reference
 - [ ] Example: drive an installed Windows application end to end, headless
 
-**Verified so far:** the Python client speaks the same wire format as the Rust host and the
+**Verified against a live guest**, not asserted:
+
+```
+click --no-click 336 397   -> pointer landed on the Wikipedia tile, hover active
+click 336 397              -> Wikipedia loaded; tab title and URL correct
+text abc123                -> appeared in the address bar, autocomplete fired
+text 'q"w@e#r$t%y&u*i:o/p-end'
+                           -> came back character for character
+```
+
+That last line is the one that matters: `"` and `@` are the two characters that stalled M4, and
+both now round-trip.
+
+**WVM-01 — `exec` reported healthy commands as `timed_out`.**
+
+`run` waited for the process to exit and only then read stdout and stderr. A Windows pipe holds
+about 64 KiB, so a process emitting more than that blocked on its next write, never exited, and
+`cmd /c dir /s C:\` came back as `"outcome":"timed_out"` with its already-produced output
+discarded. The command was fine; we had wedged it ourselves.
+
+Reporting a healthy command as hung is the worst failure mode a control channel can have — the
+caller cannot tell it from a genuinely hung command. Both pipes are now drained on their own
+threads, started before the wait loop and joined after, so the deadline measures the command rather
+than our own greed.
+
+`scripts/verify-wvm-01-regression.py` re-introduces the original sequencing and asserts the
+regression test **fails** on it. It does — it *hangs*, because the writer blocks on a full pipe
+nobody is draining. That is the bug reproducing itself, and it is stronger evidence than a failed
+assertion would have been.
+
+**Verified so far (client):** the Python client speaks the same wire format as the Rust host and the
 `boundary` subcommand starts its own daemon with an inspect-only grant, then attempts to exceed it:
 
 ```

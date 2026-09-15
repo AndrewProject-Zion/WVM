@@ -1,29 +1,40 @@
-# WVM — Windows VM control plane
+# WVM — a headless execution sandbox for AI agents
 
-A Rust control plane that lets a program drive a Windows VM as a typed tool: launch processes,
-capture screenshots, inject input, move files, snapshot and restore.
+Drive Windows 11 from a Linux terminal over a typed, hostile-peer-guarded JSON protocol.
+
+A Rust control plane that lets a program or an agent drive a Windows VM as a typed tool: launch
+processes, capture screenshots, inject input, move files, snapshot and restore. Headless by
+default, every operation through a capability boundary and an append-only journal.
+
+Give your agent a Windows guest instead of your host machine.
 
 It is **not** a desktop-integration layer. That space is well served — WinBoat (22.8k stars),
 WinPodX, winapps, LinOffice all put individual Windows windows on a Linux desktop via FreeRDP and
 RemoteApp. WVM exists for the case they do not cover: **an agent or a program driving a Windows
 guest over a typed protocol, headless, with an auditable capability boundary.**
 
-**Status: M4 complete.** Windows 11 is installed in a guest this project built and booted, the
-guest service is installed and running as a Windows service, and the host drives it end to end.
+**Status: M5 in progress.** `exec`, `capture` and `input` are implemented and verified against a
+live guest. `transfer` and `lifecycle` are honest stubs that report
+`not implemented in this build` — see [Not yet built](#not-yet-built).
 
 ## What works, verified
 
-Driven from Linux, over the control channel, with no console and no keyboard:
+Driven from Linux, over the control channel, with no console, no keyboard and no guest-side agent:
 
 ```
-hello  ->  {"status":"ready","protocol_version":1,"guest":"Windows (wvm-guest 0.1.0)"}
+hello   ->  {"status":"ready","protocol_version":1,"guest":"Windows (wvm-guest 0.1.0)"}
 
-exec   ->  {"result":"process_output","outcome":"exited","code":0,
-            "stdout":"\r\nMicrosoft Windows [Version 10.0.22631.2715]\r\n",
-            "elapsed_ms":37}
+exec    ->  {"result":"process_output","outcome":"exited","code":0,
+             "stdout":"\r\nMicrosoft Windows [Version 10.0.22631.2715]\r\n",
+             "elapsed_ms":37}
+
+capture ->  a 1024x768 PNG of the live desktop, 608 distinct colours
+
+input   ->  clicked (336,397) on the Firefox new tab page; Wikipedia loaded
 ```
 
-A process launched inside Windows, its output captured, returned to the host.
+A process launched inside Windows, its output captured, returned to the host. A screenshot of the
+real desktop. A click that lands where you aimed.
 
 | | |
 |---|---|
@@ -35,26 +46,28 @@ A process launched inside Windows, its output captured, returned to the host.
 | Guest networking | e1000e (in-box driver), `10.0.2.15` |
 | Guest service | Windows service, `StartServiceCtrlDispatcher`, auto-restart |
 | Exec | launch, capture stdout/stderr, timeout, exit status |
+| Capture | PNG of the live desktop, geometry assertion |
+| Input | absolute pointer moves and clicks, UK-correct keys and text |
 
 ## Not yet built
 
 The protocol has verbs the guest answers honestly rather than optimistically. These still return
 `not implemented in this build`:
 
-- **capture** — screenshot the guest
-- **input** — inject mouse and keyboard
 - **transfer** — move files between host and guest
 - **lifecycle** — snapshot and restore from the guest side
 
-Each has its plumbing in place and a test asserting a stub never reports success. That is M5.
+Each has its plumbing in place and a test asserting a stub never reports success.
 
-Two known gaps, recorded rather than hidden:
+## Known gaps, recorded rather than hidden
 
-- **Graceful service stop.** The control handler signals a channel and returns immediately, but the
-  serving loop blocks in `accept`, so a stop request does not interrupt it. The SCM eventually kills
-  the process. Closing this needs a non-blocking accept with a poll timeout.
-- **Pipe buffering.** Output is read after the process exits rather than concurrently. A program
-  emitting more than 64 KiB before exiting can deadlock against a full pipe.
+- **`transfer` payloads are unchunked.** When this verb lands, a large file over a raw TCP socket
+  needs chunking and backpressure, or it will meet the same buffer exhaustion that WVM-01 caused in
+  `exec`. The framing carries one JSON message per frame, so a multi-megabyte file cannot travel as
+  a single `Payload`.
+- **A guest without a display cannot be captured.** Capture runs against the QEMU framebuffer on the
+  host, so it needs QEMU to be rendering. That is inherent, not a bug — and it is why capture is
+  host-side at all (see D-009).
 
 ## Quickstart
 
@@ -85,6 +98,11 @@ wvm vm log     --config ~/wvm/install.toml --lines 60
 # 7. Drive it
 python3 scripts/talk-to-guest.py hello
 python3 scripts/talk-to-guest.py exec -- cmd.exe /c ver
+
+# or with the host binary, which also does capture and input
+wvm vm capture --config ~/wvm/wvm.toml --out /tmp/screen.png --expect 1024x768
+wvm vm input click --config ~/wvm/wvm.toml 336 397
+wvm vm input text  --config ~/wvm/wvm.toml 'hello from the host'
 ```
 
 ## Two things that will bite you
