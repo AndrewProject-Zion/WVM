@@ -71,9 +71,25 @@ impl fmt::Display for TransferPlan {
 
 /// Plan a transfer, or refuse it.
 ///
-/// `guest_root` and `host_root` come from the capability grant. Passing an empty root is not
-/// "no restriction" — it is a refusal, because a grant with no roots is a caller that has not
-/// been given a place to put anything.
+/// # Which side checks what
+///
+/// Each side constrains the paths **it** will touch, and only those:
+///
+/// - The **guest** checks the guest path against its own staging root. It is the side that reads or
+///   writes there, so it is the side that must refuse.
+/// - The guest does **not** check the host path. It cannot: that path names a file on a filesystem
+///   the guest has no view of, so a check here would be about a string, not about the file. The host
+///   applies its own containment rules before sending, and it is the only party able to.
+///
+/// An earlier version of this function DID check both, and it was wrong in a way worth recording:
+/// every honest push was refused, because the host's real path (`/tmp/...`) was never inside the
+/// guest's idea of a host root (`C:\ProgramData\wvm\staging-host`, a directory that does not exist
+/// inside the guest). The refusal was correct-looking and made the verb useless. The round-trip test
+/// caught it on the first live run.
+///
+/// This is the same principle as the capability boundary: a check belongs where the authority to
+/// make it exists. A second check in a place that cannot know the answer does not add safety — it
+/// adds a way for two sides to disagree.
 pub fn plan(
     direction: Direction,
     guest_root: &str,
@@ -88,19 +104,15 @@ pub fn plan(
         bail!("refusing transfer: the grant declares no host root");
     }
 
-    // Guest side: containment checked with the shared Windows path rules.
+    // The guest path is this side's responsibility: resolved and contained against the staging root.
     let resolved_guest = paths::resolve_within(guest_root, guest_path)?;
 
-    // Host side: the host has already applied its own rules, but refusing to take an obviously
-    // outside-the-root path here means a bug on the host cannot turn into a write anywhere on
-    // the guest's view of the host filesystem.
-    if !host_path.starts_with(host_root.trim_end_matches('/')) {
-        bail!(
-            "refusing transfer: host path '{}' is outside '{}'",
-            host_path,
-            host_root
-        );
+    // The host path is recorded, not validated. See the note above — the host owns that check.
+    if host_path.trim().is_empty() {
+        bail!("refusing transfer: empty host path");
     }
+
+    let _ = host_root;
 
     if guest_path.trim().is_empty() {
         bail!("refusing transfer: empty guest path");
@@ -333,18 +345,40 @@ mod tests {
     }
 
     #[test]
-    fn a_host_path_outside_its_root_is_refused() {
-        // The host should never send this, but if it does, refusing here means a host bug cannot
-        // become a write anywhere on the guest's view of the host filesystem.
-        let err = plan(
+    fn the_host_path_is_recorded_not_validated_by_the_guest() {
+        // The guest must NOT check the host path. It cannot know what that path means: the name
+        // refers to a file on a filesystem the guest has no view of, so any check here is about a
+        // string rather than about the file.
+        //
+        // The earlier version of `plan` did check it, and the effect was that every honest push was
+        // refused — the host's real path (`/tmp/...`) was never inside the guest's idea of a host
+        // root (`C:\ProgramData\wvm\staging-host`, which does not exist inside the guest). A
+        // correct-looking refusal that made the verb useless.
+        //
+        // A host path outside any host root is therefore PLANNED. Whether it is permitted is the
+        // host's decision, taken before the request is sent, and the host is the only party with the
+        // information to take it.
+        let ok = plan(
             Direction::GuestToHost,
             GUEST_ROOT,
             HOST_ROOT,
             "C:\\wvm\\file.txt",
             "/etc/passwd",
         )
-        .expect_err("must be refused");
-        assert!(err.to_string().contains("outside"));
+        .expect("the guest must not reject a host path it cannot evaluate");
+        assert_eq!(ok.host_path, "/etc/passwd");
+
+        // What the guest DOES still refuse: an empty host path, because a transfer with no
+        // destination on the other side is not a request that can be carried out.
+        let err = plan(
+            Direction::GuestToHost,
+            GUEST_ROOT,
+            HOST_ROOT,
+            "C:\\wvm\\file.txt",
+            "",
+        )
+        .expect_err("an empty host path must be refused");
+        assert!(err.to_string().contains("empty host path"));
     }
 
     #[test]
