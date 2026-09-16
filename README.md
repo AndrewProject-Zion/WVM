@@ -23,6 +23,33 @@ guest over a typed protocol, headless, with an auditable capability boundary.**
 implemented and verified against a live guest. `lifecycle` is an honest stub that reports
 `not implemented in this build`.
 
+## The one command to run first
+
+Before installing anything, watch the capability boundary work:
+
+```sh
+python3 examples/wvm_client.py boundary
+```
+
+```
+Daemon started with the grant: inspect only
+
+  hello      -> handshake accepted; peer reports: no guest channel yet (M3 not started)
+  inspect    -> inventory: os='host (no guest channel yet)', 0 drive(s), 0 app(s)
+  capture    -> REFUSED
+  lifecycle  -> REFUSED
+  exec       -> REFUSED
+
+Every ungranted verb was refused. The grant held.
+```
+
+That runs on this machine with nothing but Python installed. It starts a real daemon with a
+deliberately narrow grant, then tries to exceed it four times — and the refusals are the product.
+
+`examples/wvm_client.py` is also a second, independent implementation of the wire format, stdlib
+only. A protocol with one implementation has no way to notice that its own encoder and decoder
+disagree; two implementations surface that immediately.
+
 ## What works, verified
 
 Driven from Linux, over the control channel, with no console, no keyboard and no guest-side agent:
@@ -288,8 +315,43 @@ that did not respond as expected, a guest mid-boot.
 python3 scripts/vm-with-display.py --display vnc ~/wvm/wvm.toml
 ```
 
-For VNC, point Remmina (or any viewer) at `127.0.0.1:5900` — no password, so bind it to loopback
-only. `Ctrl+Alt+G` releases the mouse and keyboard from a GTK window.
+For VNC, point Remmina (or any viewer) at `127.0.0.1:5900` — bound to loopback, no password, so do
+not forward that port. `--display sdl` also works if GTK misbehaves under your compositor.
+
+`--vnc-port N` moves it if 5900 is taken.
+
+### Working in the guest by hand
+
+Watching is the small half of this. The display is a **real interactive session**, so you can also
+take the keyboard and do the things an agent should not be trusted to do unattended: run an installer
+that wants a licence click, log into a Microsoft account, set a password, install a driver, or debug
+the app your agent is failing to drive.
+
+Three things make that practical:
+
+**Type into it.** Send keystrokes to the guest's console without a display attached at all — useful
+when you want to hand-type one command into a headless VM:
+
+```sh
+python3 scripts/qmp_input.py <socket> text "winget install --id Git.Git"
+python3 scripts/qmp_input.py <socket> key ret
+```
+
+**Screenshot without watching.** `wvm vm capture` returns a PNG of whatever the desktop currently
+shows, so a script can record what happened rather than a human having to sit there.
+
+**Paste a command from the host.** Type it in the window, or use `Run` (`Meta+R`) when you want a
+clean single command rather than a shell prompt.
+
+Practicalities worth knowing, each learned the hard way:
+
+- The guest runs a **UK keyboard layout**. If yours differs, characters arrive shifted — quote marks
+  and backslashes are the usual casualties.
+- `Ctrl+Alt+G` releases the mouse **only if a grab is active**. The generated command line uses a
+  plain `-display gtk` with no `grab-on-hover`, so nothing grabs and there is nothing to release. If
+  you add a grab option yourself, that is the key that frees it.
+- UAC prompts need a real click. Driving them through emulated input is unreliable, and when a
+  prompt is waiting the agent's commands will appear to hang with no visible reason.
 
 You will see the exact desktop the agent is manipulating, because input arrives as **emulated USB
 hardware** (`usb-tablet`) rather than through any Windows API, and the guest's own Session 1 desktop
@@ -369,16 +431,6 @@ wvm-guest/   the Windows service: transport, dispatch, Win32 execution, path con
 docs/        design record — decisions, verified environment, build plan, install status, origin
 scripts/     tooling, each written for a specific failure that cost time
 examples/    a dependency-free Python client, and an executable demonstration of the gate
-```
-
-## The client
-
-`examples/wvm_client.py` is a second, independent implementation of the wire format — stdlib only.
-A protocol with one implementation has no way to notice that its own encoder and decoder
-disagree; two implementations surface that immediately.
-
-```sh
-python3 examples/wvm_client.py boundary   # starts a daemon, then tries to exceed its grant
 ```
 
 ## Licence
