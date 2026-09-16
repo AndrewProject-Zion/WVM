@@ -8,6 +8,12 @@ default, every operation through a capability boundary and an append-only journa
 
 Give your agent a Windows guest instead of your host machine.
 
+![An agent pushing a payload into a Windows guest, running it, and pulling the artifact back out](docs/demo.gif)
+
+*Left: the typed protocol. Right: the same guest, live, receiving the transfer and running the code.
+Both halves are real — the GIF is rendered from the actual commands by
+`scripts/make-demo-gif.py`, so it cannot drift from the code or show anything the tool did not do.*
+
 It is **not** a desktop-integration layer. That space is well served — WinBoat (22.8k stars),
 WinPodX, winapps, LinOffice all put individual Windows windows on a Linux desktop via FreeRDP and
 RemoteApp. WVM exists for the case they do not cover: **an agent or a program driving a Windows
