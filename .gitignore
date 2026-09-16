@@ -15,3 +15,9 @@ vm_password.txt
 # Python bytecode. Generated, not source.
 __pycache__/
 *.pyc
+
+# Editor and agent backup files. These are working artefacts, not source — a timestamped copy of a
+# file that is also in the tree is noise in a public repository, and one was committed by accident.
+*.bak
+*.bak.*
+*.orig
