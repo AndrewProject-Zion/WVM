@@ -16,6 +16,7 @@ mod guestclient;
 mod image;
 mod input;
 mod journal;
+mod lifecycle;
 mod policy;
 mod pull;
 mod push;
@@ -23,7 +24,7 @@ mod server;
 mod supervisor;
 mod vm;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::time::Duration;
 use wvm_ipc::{RequestKind, Verb, PROTOCOL_VERSION};
@@ -183,6 +184,27 @@ enum VmAction {
         /// caller that retried.
         #[arg(long)]
         overwrite: bool,
+    },
+
+    /// Snapshot, restore and list VM state.
+    ///
+    /// A snapshot writes the machine's RAM and device state INTO the disk's own qcow2 as an
+    /// internal snapshot. It is not a disk-only revert point: restoring returns the guest to the
+    /// running state it was in, which is what makes this useful before letting an agent do
+    /// something it might need to undo.
+    ///
+    /// Requires the VM to be running — QEMU holds the state, so this is a QMP operation against a
+    /// live hypervisor.
+    Snapshot {
+        #[arg(long, default_value = "wvm.toml", global = true)]
+        config: std::path::PathBuf,
+
+        /// `save`, `restore`, `list` or `delete`.
+        #[arg(value_parser = ["save", "restore", "list", "delete"])]
+        action: String,
+
+        /// The snapshot name. Not used by `list`.
+        tag: Option<String>,
     },
 
     /// Capture the guest's screen as a PNG.
@@ -364,6 +386,7 @@ fn run_vm(action: VmAction) -> Result<()> {
         | VmAction::Log { config, .. }
         | VmAction::Transfer { config, .. }
         | VmAction::Capture { config, .. }
+        | VmAction::Snapshot { config, .. }
         | VmAction::Input { config, .. } => config.clone(),
     };
 
@@ -565,6 +588,74 @@ fn run_vm(action: VmAction) -> Result<()> {
             }
         }
 
+        VmAction::Snapshot { action, tag, .. } => {
+            let config = supervisor.config();
+
+            // Snapshots need a live hypervisor: the machine state being saved lives in QEMU, so a
+            // stopped VM has nothing to snapshot. Say so plainly rather than connecting and
+            // producing a confusing socket error.
+            if !supervisor.state().is_running() {
+                anyhow::bail!(
+                    "the VM is not running, so there is no machine state to work with. \
+                     A snapshot captures RAM as well as disk, and RAM only exists while the guest \
+                     is up. Start it with `wvm vm start`"
+                );
+            }
+
+            let mut qmp = supervisor::Qmp::connect(&config.qmp_socket())?;
+
+            match action.as_str() {
+                "list" => {
+                    let snapshots = lifecycle::list(&mut qmp)?;
+                    if snapshots.is_empty() {
+                        println!("no snapshots on this disk");
+                    } else {
+                        println!("snapshots on this disk:");
+                        for s in snapshots {
+                            println!(
+                                "  {:<20} {:>10}   (id {})",
+                                s.tag,
+                                human_size(s.vm_size_bytes),
+                                s.id
+                            );
+                        }
+                    }
+                }
+                "save" => {
+                    let tag = tag
+                        .as_deref()
+                        .context("a snapshot needs a name: `wvm vm snapshot save <tag>`")?;
+                    println!("saving the machine state as '{tag}' — this can take a few seconds");
+                    let s = lifecycle::save(&mut qmp, tag)?;
+                    println!(
+                        "  saved '{tag}' — {} of machine state (RAM and devices)",
+                        human_size(s.vm_size_bytes)
+                    );
+                }
+                "restore" => {
+                    let tag = tag
+                        .as_deref()
+                        .context("name the snapshot to restore: `wvm vm snapshot restore <tag>`")?;
+                    println!("restoring '{tag}' — the guest will roll back to that moment");
+                    lifecycle::restore(&mut qmp, tag)?;
+                    println!("  restored '{tag}'");
+                    println!(
+                        "  the guest is still running; anything written since the snapshot is gone"
+                    );
+                }
+                "delete" => {
+                    let tag = tag
+                        .as_deref()
+                        .context("name the snapshot to delete: `wvm vm snapshot delete <tag>`")?;
+                    lifecycle::delete(&mut qmp, tag)?;
+                    println!("  deleted '{tag}'");
+                }
+                other => anyhow::bail!("unknown snapshot action '{other}'"),
+            }
+
+            Ok(())
+        }
+
         VmAction::Capture { out, expect, .. } => {
             let config = supervisor.config();
 
@@ -670,6 +761,26 @@ fn run_vm(action: VmAction) -> Result<()> {
 }
 
 /// Parse a `WIDTHxHEIGHT` geometry string.
+/// Bytes as a human would write them, for sizes the caller is judging at a glance.
+///
+/// A snapshot size is the number a caller uses to decide whether it is worth keeping, so "3.37 GiB"
+/// is more useful than "3618814771". One decimal place: more precision implies a certainty the
+/// measurement does not have, since QEMU reports it rounded already.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 4] = [
+        ("TiB", 1024 * 1024 * 1024 * 1024),
+        ("GiB", 1024 * 1024 * 1024),
+        ("MiB", 1024 * 1024),
+        ("KiB", 1024),
+    ];
+    for (unit, scale) in UNITS {
+        if bytes >= scale {
+            return format!("{:.2} {unit}", bytes as f64 / scale as f64);
+        }
+    }
+    format!("{bytes} B")
+}
+
 fn parse_geometry(spec: &str) -> Result<(u32, u32)> {
     let (w, h) = spec
         .split_once(['x', 'X'])

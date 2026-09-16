@@ -63,6 +63,7 @@ PROBES=(
     "transfer: push and pull      | yes | python3 scripts/test-transfer-roundtrip.py --port $PORT"
     "exec: timeout kills the tree | yes | python3 scripts/test-timeout-tree-kill.py --port $PORT"
     "channel survives a wedge     | yes | python3 scripts/verify-request-deadline.py --port $PORT"
+    "snapshot rolls the machine back | yes | python3 scripts/verify-snapshot-rollback.py --port $PORT"
 )
 
 if [ "$LIST" -eq 1 ]; then

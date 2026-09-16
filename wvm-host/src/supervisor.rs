@@ -29,9 +29,20 @@ use crate::vm::VmConfig;
 /// `qmp_capabilities`, then commands. Implemented directly rather than through a client crate so
 /// the wire format is visible and the dependency list stays short — this is a small enough
 /// protocol that a library would be more surface area than help.
+/// The read timeout for an ordinary QMP command.
+///
+/// QMP operations are request/response and a hung daemon must not hang the CLI forever. Jobs get a
+/// longer timeout of their own — see `next_event_with_timeout`.
+const DEFAULT_QMP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 pub struct Qmp {
     stream: UnixStream,
     reader: BufReader<UnixStream>,
+    /// Events read while waiting for a command reply, kept for `next_event` to drain.
+    ///
+    /// A `VecDeque` rather than a channel because there is a single reader and the ordering matters:
+    /// job status transitions arrive in order and a caller inspecting them wants that order kept.
+    pending_events: std::collections::VecDeque<Value>,
 }
 
 impl std::fmt::Debug for Qmp {
@@ -48,11 +59,15 @@ impl Qmp {
             .with_context(|| format!("connecting to QMP socket {}", socket.display()))?;
         // QMP operations are request/response; a hung daemon must not hang the CLI forever.
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(DEFAULT_QMP_TIMEOUT))
             .context("setting a read timeout on the QMP socket")?;
         let reader = BufReader::new(stream.try_clone()?);
 
-        let mut qmp = Qmp { stream, reader };
+        let mut qmp = Qmp {
+            stream,
+            reader,
+            pending_events: std::collections::VecDeque::new(),
+        };
 
         // The greeting arrives unprompted and must be consumed before anything else.
         let greeting = qmp.read_message()?;
@@ -77,6 +92,10 @@ impl Qmp {
 
     /// Run one command and return its result.
     pub fn execute(&mut self, command: &str, arguments: Option<Value>) -> Result<Value> {
+        // A command reply is read with the connection's default timeout, whatever a previous job
+        // loop may have set. Without this, a long job timeout would make a hung daemon hang the CLI.
+        let _ = self.stream.set_read_timeout(Some(DEFAULT_QMP_TIMEOUT));
+
         let mut payload = json!({ "execute": command });
         if let Some(args) = arguments {
             payload["arguments"] = args;
@@ -89,6 +108,15 @@ impl Qmp {
         self.stream.flush()?;
 
         // Skip asynchronous events until the reply carrying our command's result arrives.
+        //
+        // Events encountered here are QUEUED, not discarded. The first version threw them away,
+        // which is wrong for any command whose completion is reported as events: `snapshot-save`
+        // returns immediately and then reports progress through JOB_STATUS_CHANGE, and those
+        // events can arrive BEFORE this reply. Discarding them meant the caller's event loop then
+        // waited forever for a transition that had already been consumed — a race, so it appeared
+        // intermittently and looked like a timeout rather than a lost message.
+        //
+        // The queue is drained by `next_event`.
         loop {
             let message = self.read_message()?;
             if let Some(err) = message.get("error") {
@@ -97,7 +125,102 @@ impl Qmp {
             if message.get("return").is_some() {
                 return Ok(message["return"].clone());
             }
-            // Anything else is an event; ignore it here.
+            self.pending_events.push_back(message);
+        }
+    }
+
+    /// Read the next asynchronous EVENT, or `None` if none arrives within `timeout`.
+    ///
+    /// `execute()` deliberately discards events while waiting for a command reply. Snapshot jobs
+    /// are the opposite shape: the command returns immediately and the OUTCOME arrives as events,
+    /// so something has to read them. That is this.
+    ///
+    /// A timeout returns `None` rather than an error, because waiting for an event that has not
+    /// happened yet is the normal case — the caller loops. Distinguishing "nothing yet" from
+    /// "something went wrong" is what stops a polling loop from treating ordinary patience as a
+    /// failure.
+    /// Read the next asynchronous EVENT, or `None` if the read timeout expires first.
+    ///
+    /// `execute()` deliberately discards events while waiting for a command reply. Snapshot jobs
+    /// are the opposite shape: the command returns immediately and the OUTCOME arrives as events,
+    /// so something has to read them. That is this.
+    ///
+    /// **This function never changes the socket timeout.** That is the whole design, and it is a
+    /// correction of an earlier version that did — and broke the guest:
+    ///
+    /// - `connect()` already sets a read timeout for the connection, so there was nothing to add.
+    /// - Overwriting it with a shorter value meant a slow-but-healthy read (a snapshot job taking
+    ///   longer than two seconds) timed out as though it had hung.
+    /// - Worse, restoring the timeout afterwards used `?`, so an error return skipped the restore
+    ///   and left the short timeout in place for every later caller on a shared socket.
+    /// - And `read_line` on a `BufReader` consumes bytes into its own buffer as it goes, so a
+    ///   timeout part-way through a line left a fragment that the NEXT read resumed from. The
+    ///   stream desynchronised permanently and QEMU was left mid-message, which wedged the guest
+    ///   itself — not just the client.
+    ///
+    /// The lesson recorded here: mutating shared connection state to satisfy one caller is a
+    /// trap, and the failure it produces (a dead control channel that looks like a hung guest) is
+    /// the most expensive kind to diagnose in this project.
+    ///
+    /// A timeout returns `None` rather than an error, because an event that has not happened yet is
+    /// the normal case — the caller loops until its own deadline.
+    /// As `next_event`, with an explicit socket timeout for the read.
+    ///
+    /// Job events arrive over a job that legitimately runs for seconds, while the connection's
+    /// default timeout is tuned for a quick command. So a job loop needs a longer one — and the
+    /// restore of the default must happen on EVERY path.
+    ///
+    /// An earlier version of this function set a timeout, then restored it with `?`, so an error
+    /// return skipped the restore and left a short timeout on a shared socket. Worse,
+    /// `BufReader::read_line` had already consumed part of a message into its buffer, so the next
+    /// read resumed mid-line, desynchronising the stream and wedging QEMU itself.
+    ///
+    /// The restore below is therefore unconditional and ignores its own error: there is no useful
+    /// recovery if setting a socket option fails, and skipping it would reintroduce the wedge.
+    pub fn next_event_with_timeout(
+        &mut self,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Option<Value>> {
+        // Anything already read while waiting for a command reply comes first. Without this, events
+        // that arrived during `execute` would be invisible to the caller — which is exactly the
+        // race that made snapshot-save look like it timed out.
+        if let Some(queued) = self.pending_events.pop_front() {
+            return Ok(Some(queued));
+        }
+
+        self.stream.set_read_timeout(timeout).ok();
+        let result = self.read_message();
+        // Restore to the CONNECTION default, on every path.
+        //
+        // The job loop sets a longer timeout per call, so the restore is what keeps a job's
+        // generosity from leaking into the next quick command. It also cannot be skipped: an
+        // earlier version restored it with `?` and a failed read left a short timeout on a shared
+        // socket, which wedged the guest.
+        //
+        // Note the job loop passes its timeout on EVERY read rather than relying on this one
+        // persisting. A 6.5-second pause while QEMU freezes the CPUs is normal during a snapshot,
+        // so a single read can easily outlast the default — measured, not assumed.
+        let _ = self.stream.set_read_timeout(Some(DEFAULT_QMP_TIMEOUT));
+
+        match result {
+            Ok(message) => {
+                if message.get("event").is_some() {
+                    Ok(Some(message))
+                } else {
+                    // A reply rather than an event: not what this call is for, and silently
+                    // returning it would corrupt the caller's view of the stream.
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                let text = e.to_string();
+                if text.contains("timed out") || text.contains("WouldBlock") {
+                    // Nothing yet. The caller's own deadline decides when to give up.
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
         }
     }
 

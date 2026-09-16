@@ -379,7 +379,23 @@ pub fn handle(request: &Request) -> Response {
             }
         }
 
-        Request::Lifecycle { .. } => not_yet("lifecycle"),
+        // Lifecycle is a HOST-side operation and the guest cannot perform it.
+        //
+        // Snapshots are a QEMU capability: the machine state lives in the hypervisor, and the guest
+        // is a VM with no view of its own hypervisor process. This refusal is therefore not a
+        // "not written yet" stub — it is the correct answer, and it will stay the correct answer.
+        //
+        // The verb exists in the protocol so the guest can REPORT it as unsupported rather than
+        // being silent about it, which lets a client discover the boundary by asking. Same shape as
+        // the platform refusals for transfer: name what is missing and where it lives.
+        Request::Lifecycle { action } => Response::Error {
+            message: format!(
+                "lifecycle/{action}: snapshots are a hypervisor operation and are driven from the \
+                 HOST over QMP, not from inside the guest. Use `wvm vm snapshot save|restore|list` \
+                 on the host. This verb answers here so the boundary is discoverable by asking, \
+                 rather than by a connection timing out"
+            ),
+        },
     }
 }
 
@@ -545,17 +561,16 @@ mod tests {
     fn unimplemented_operations_report_honestly() {
         // The critical property: a stub must never look like a success.
         //
-        // `exec`, `capture` and `transfer` are no longer here — all three have real
-        // implementations. On a host build their platform halves cannot run, and each reports that
-        // explicitly rather than claiming to be unwritten; see the tests below.
-        let cases = vec![
-            Request::Input {
-                event: InputEvent::MouseMove { x: 0, y: 0 },
-            },
-            Request::Lifecycle {
-                action: LifecycleAction::Suspend,
-            },
-        ];
+        // `exec`, `capture`, `transfer` AND `lifecycle` are no longer here — none is unwritten any
+        // more. Lifecycle moved out because it turned out to be a HOST-side operation: snapshots
+        // are a hypervisor capability, so the guest refusing them is the correct permanent answer
+        // rather than a "not yet". That has its own test below.
+        //
+        // What remains genuinely unwritten is `input` on a host build, which cannot inject into a
+        // guest that does not exist.
+        let cases = vec![Request::Input {
+            event: InputEvent::MouseMove { x: 0, y: 0 },
+        }];
 
         for req in cases {
             match handle(&req) {
@@ -566,6 +581,44 @@ mod tests {
                     );
                 }
                 other => panic!("a stub must not report success; got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_is_refused_as_architecturally_impossible_not_as_unwritten() {
+        // The distinction matters and is easy to lose.
+        //
+        // A "not implemented yet" says: try again after an upgrade. A refusal that is
+        // architecturally permanent says: stop asking, this will never work from here. Lifecycle is
+        // the second: the machine state lives in QEMU, the guest has no view of its own
+        // hypervisor, and no future version of this service changes that.
+        //
+        // If someone later makes this answer "not implemented", a caller would reasonably keep
+        // retrying a request that can never succeed. So the wording is asserted, not just the fact
+        // that it is an error.
+        for action in [
+            LifecycleAction::Suspend,
+            LifecycleAction::Snapshot,
+            LifecycleAction::Restore,
+        ] {
+            match handle(&Request::Lifecycle { action }) {
+                Response::Error { message } => {
+                    assert!(
+                        !message.contains("not implemented"),
+                        "lifecycle must not read as merely unwritten: {message}"
+                    );
+                    assert!(
+                        message.contains("HOST"),
+                        "the refusal must say WHERE the operation lives, or it is a dead end for \
+                         the caller: {message}"
+                    );
+                    assert!(
+                        message.contains("wvm vm snapshot"),
+                        "the refusal must name the command that does work: {message}"
+                    );
+                }
+                other => panic!("lifecycle must refuse from the guest; got {other:?}"),
             }
         }
     }

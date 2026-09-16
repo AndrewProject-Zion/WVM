@@ -276,6 +276,20 @@ pub enum LifecycleAction {
     Shutdown,
 }
 
+impl std::fmt::Display for LifecycleAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The wire spelling, matching the serde rename, so an error message and the request that
+        // caused it use the same word. A caller comparing them should not have to translate.
+        match self {
+            LifecycleAction::Suspend => write!(f, "suspend"),
+            LifecycleAction::Resume => write!(f, "resume"),
+            LifecycleAction::Snapshot => write!(f, "snapshot"),
+            LifecycleAction::Restore => write!(f, "restore"),
+            LifecycleAction::Shutdown => write!(f, "shutdown"),
+        }
+    }
+}
+
 impl Request {
     /// Construct a request, refusing anything the grant does not permit.
     ///
