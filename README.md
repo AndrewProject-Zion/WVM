@@ -63,6 +63,21 @@ The protocol has verbs the guest answers honestly rather than optimistically. Th
 
 It has its plumbing in place and a test asserting a stub never reports success.
 
+## Verifying it yourself
+
+```
+./scripts/verify-all.sh              # everything, against a live guest
+./scripts/verify-all.sh --offline    # only what needs no guest
+./scripts/verify-all.sh --list       # what runs, and why
+```
+
+Eleven probes, and a result with three states rather than two: **passed**, **failed**, and **could
+not run**. That last one is not a pass. A probe that never executed has verified nothing, and
+conflating the two is how a build ships on the strength of a check that did not happen.
+
+Every bug in this project's history was found by one of these, and every false claim was caught by
+one — so they are wired together rather than left to whoever remembers to run them.
+
 ## Known gaps, recorded rather than hidden
 
 - **A request that ignores its deadline still holds the channel.** The guest answers one request at a

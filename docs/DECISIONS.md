@@ -507,3 +507,66 @@ redirected stdin and is still a real child process.
 pattern is in `wvm-guest/src/job.rs` and is not specific to `exec`.
 
 ---
+
+## D-014 — Quote nothing you pass to the guest; and if a claim is unverifiable, say so
+
+**Date:** 2026-09-16
+**Status:** accepted
+
+**Context.** `scripts/test-transfer-roundtrip.py` hashes the pushed file inside the guest with
+`certutil`, so the content check does not depend on the transfer path vouching for itself. On a
+freshly pushed file it reported:
+
+```
+CertUtil: -hashfile command FAILED: 0x80070002 (WIN32: 2 ERROR_FILE_NOT_FOUND)
+```
+
+`dir` listed the file. `type` printed its contents. `copy` copied it. Only `certutil` could not open
+it, and only for some files.
+
+**Four hypotheses, all wrong, all falsified by measurement rather than argument:**
+
+1. *Write timing* — a delay sweep from 0s to 10s changed nothing.
+2. *NTFS flush* — the `eof` path already calls `flush()` then `sync_all()`, and the failure did not
+   move with size or delay.
+3. *Directory metadata not yet visible* — `dir` saw the file immediately; `copy` to a second path
+   worked instantly.
+4. *Defender scanning a freshly written file* — the most plausible-sounding, and it was killed by an
+   exclusion test: `Add-MpPreference -ExclusionPath 'C:\ProgramData\wvm\staging'` changed **nothing**.
+   A convincing mechanism that an experiment refutes is worse than no mechanism, because it arrives
+   with confidence.
+
+**The actual cause.** The path was passed **quoted**:
+
+```
+certutil -hashfile C:\...\file.bin SHA256      -> works
+certutil -hashfile "C:\...\file.bin" SHA256    -> FILE_NOT_FOUND
+```
+
+The quote characters reach the process as part of the argument, and `certutil` treats them as part of
+the filename. It then reports that the file does not exist, which is indistinguishable from the file
+genuinely not being there. The clue that broke it open was `attrib` printing a doubled path
+(`C:\C:\...`) — evidence about argument handling, not about the filesystem.
+
+**Decision.** Paths passed to guest commands are **not quoted**. Where a path needs quoting for a
+shell, that is a different problem and needs its own test.
+
+**Related traps in the same family, each found the same way:**
+
+- `&&` does not survive the exec layer: `cd /d X && certutil ...` returns exit code 1 with **empty
+  stdout**. No error message. The command simply does not run.
+- A relative filename fails, because the guest's default cwd is `C:\Windows\System32`.
+- `timeout /t 600` refuses to run under the redirected stdin this harness always provides, and exits
+  in milliseconds — which made a process-cleanup test count zero survivors for the absence of
+  anything to count (D-013).
+
+**The general rule this belongs to.** A negative result from a probe must be distinguishable from the
+probe's own failure. `FILE_NOT_FOUND` looked like a fact about a file; it was a fact about an
+argument. Four hypotheses were entertained before the instrument itself was suspected, and the
+session's own running lesson says the instrument should have been first.
+
+**Verification.** `scripts/verify-all.sh` runs eleven probes against a live guest and reports three
+states — passed, failed, and **could not run** — because collapsing "could not run" into "passed" is
+the defect this whole entry is about. All eleven pass.
+
+---

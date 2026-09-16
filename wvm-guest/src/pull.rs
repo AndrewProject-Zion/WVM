@@ -162,8 +162,14 @@ pub fn read_chunk(path_in_root: &str, offset: u64, length: u64) -> Result<(Vec<u
 
         // Close on the last chunk, so a second pull of the same file starts cleanly rather than
         // continuing from a stale position.
+        //
+        // Only THIS source is closed, never the whole map. This was `m.clear()` — the same defect
+        // as in `chunk.rs`, for the same reason, and it survived for the same reason: one transfer
+        // at a time means there is nothing else in the map to destroy, so the bug is unreachable
+        // until something leaves a second entry behind.
         if eof {
-            m.clear();
+            let src_path = src.path.clone();
+            m.remove(&src_path);
         }
 
         Ok((buf, eof, total))

@@ -102,26 +102,63 @@ def main():
 
     # --- 2. GUEST -> HOST with a large base64 payload ---
     #
-    # `capture` returns a base64 PNG through the same framing, so it exercises a large base64 string
-    # in the harder direction: a big RESPONSE, where the host must reassemble a multi-hundred-KB
-    # frame across however many TCP segments it arrives in.
+    # This used `capture`, which returned a base64 PNG through the same framing, exercising the
+    # harder direction: a big RESPONSE the host must reassemble across however many TCP segments it
+    # arrives in.
+    #
+    # That no longer works and is not supposed to. `capture` runs on the HOST via QMP screendump
+    # now, because a Windows service in session 0 cannot read the interactive desktop (D-009).
+    # The guest-side capture path is deliberately unwired, so this probe spent its time asserting
+    # that a dead code path was dead.
+    #
+    # `pull_chunk` is the honest replacement: it returns up to 256 KiB of file data base64-encoded
+    # through exactly the same framing, so the large-response question is still what is being
+    # tested, using a path that is actually live. The bytes are self-checking too — the host
+    # compares a hash rather than trusting a byte count.
     print()
-    print("GUEST -> HOST (large base64 response, via capture)")
+    print("GUEST -> HOST (large base64 response, via pull_chunk)")
+    staging = r"C:\ProgramData\wvm\staging"
+    source = staging + r"\carrier-probe.bin"
+    payload = os.urandom(256 * 1024)
+    want = hashlib.sha256(payload).hexdigest()
+
+    # Put the file there so there is something to pull. A push is the only way in, which is the
+    # point of the staging design.
+    call(args.port, {"op": "transfer", "direction": "host_to_guest", "host_path": None,
+                     "guest_path": source, "overwrite": True})
+    off = 0
+    while off < len(payload):
+        piece = payload[off:off + CHUNK]
+        call(args.port, {"op": "transfer_chunk", "offset": off,
+                         "data_base64": base64.b64encode(piece).decode(),
+                         "eof": off + len(piece) >= len(payload)})
+        off += len(piece)
+
+    # A pull needs its own open, in the OTHER direction: the guest is the SOURCE here, so the
+    # transfer that names the file is `guest_to_host`. The verb carries no path — the source was
+    # named and checked when it was opened, which is what stops a mid-stream chunk from naming a
+    # file of its own choosing.
+    call(args.port, {"op": "transfer", "direction": "guest_to_host", "host_path": None,
+                     "guest_path": source, "overwrite": True})
+
     t0 = time.monotonic()
-    r = call(args.port, {"op": "capture", "monitor": 0})
+    r = call(args.port, {"op": "pull_chunk", "offset": 0, "length": 256 * 1024})
     dt = (time.monotonic() - t0) * 1000
     if not r or r.get("status") != "ok":
-        failures.append(f"capture failed, so the response path is unproven: {r}")
+        failures.append(f"the large response path is unproven: {r}")
         print(f"  FAILED: {r}")
     else:
-        png_b64 = r["payload"]["png_base64"]
-        png = base64.b64decode(png_b64)
-        print(f"  received {len(png_b64)} base64 chars -> {len(png)} raw bytes in {dt:.0f} ms")
-        print(f"  PNG magic {png[:4]!r} (must be b'\\x89PNG')")
-        if png[:4] != b"\x89PNG":
-            failures.append("the reassembled payload is not a PNG — the frame was corrupted")
+        raw = base64.b64decode(r["payload"]["data_base64"])
+        got = hashlib.sha256(raw).hexdigest()
+        print(f"  received {len(r['payload']['data_base64'])} base64 chars -> {len(raw)} raw bytes "
+              f"in {dt:.0f} ms")
+        if got != want:
+            failures.append(f"the large response was corrupted: {got[:16]} != {want[:16]}")
         else:
-            print("  frame reassembled intact at this size")
+            print(f"  sha256 {got[:16]}… MATCHES the bytes that were sent")
+            print("  -> a full-size base64 response crosses the framing intact")
+            # No PNG check any more: the payload is random bytes whose hash is the assertion.
+            # A magic-number check would only have re-tested the encoder, not the framing.
 
     # --- 3. HOST -> GUEST with a 341 KB JSON frame ---
     #

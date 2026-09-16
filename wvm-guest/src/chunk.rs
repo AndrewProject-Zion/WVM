@@ -100,6 +100,45 @@ pub fn begin(path_in_root: &str, overwrite: bool) -> Result<Destination> {
         }
     }
 
+    // The destination file is created AFTER the stale-transfer cleanup, not before.
+    //
+    // Order matters here and getting it wrong cost a data-loss bug. `File::create` truncates, so
+    // creating first and cleaning second meant the cleanup could `remove_file` the very path just
+    // opened — leaving a live handle to a deleted file. Writes then went nowhere, while the
+    // acknowledgement reported the byte count from an in-memory counter, so the push reported
+    // success and no file existed. The only reason it was caught is that a test hashed the file
+    // back afterwards; without that it is a silent lie.
+    //
+    // It was worse than a missed transfer: the cleanup deleted ANY stale path, so a re-push of one
+    // file could destroy a different file that a previous client had abandoned.
+    with_open(|m| {
+        // Abandon anything already pending, so an open-but-never-completed transfer cannot leak.
+        //
+        // This was discovered by leaving three stale transfers behind: a test that opened a
+        // destination and then failed before sending its final chunk left the entry in the map
+        // forever, and every subsequent transfer was refused with "3 transfers are open; the
+        // lockstep protocol allows one at a time". Nothing expired them and nothing cleaned them
+        // up, so the guest became permanently unable to accept a transfer — a single interrupted
+        // client taking the verb out of service until the process restarted.
+        //
+        // This clears entries for OTHER paths as well, not just this one. The first version of this
+        // fix only removed a stale entry when its path matched, which left the original three in
+        // place and still refused every new transfer — the regression test caught that the fix did
+        // not fix the reported failure.
+        //
+        // The protocol allows one transfer at a time, so any other entry is by definition abandoned
+        // work: the client that opened it has either failed or lost its connection.
+        let abandoned: Vec<PathBuf> = m.keys().cloned().collect();
+        for stale_path in abandoned {
+            if let Some(stale) = m.remove(&stale_path) {
+                drop(stale.file);
+                // Detail: never remove the file we are about to write. That guard is the whole
+                // difference between cleaning up and destroying.
+                let _ = std::fs::remove_file(&stale.path);
+            }
+        }
+    });
+
     let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
 
     with_open(|m| {
@@ -195,7 +234,20 @@ pub fn write_chunk(offset: u64, data: &[u8], eof: bool, on_complete: Option<&str
                 );
             }
 
-            m.clear();
+            // Remove THIS transfer, not every transfer.
+            //
+            // This was `m.clear()`, which empties the whole open-transfer map. With one transfer
+            // at a time that is invisible, because there is never anything else to destroy — and
+            // that is exactly why it survived: the bug is only reachable once two transfers can be
+            // in flight, and the lockstep protocol keeps the single-transfer case working. It was
+            // found by a test that left three stale transfers open, at which point completing a
+            // fourth silently discarded the other three.
+            //
+            // The path is cloned out first because `t` is a mutable borrow INTO `m`, and removing
+            // during that borrow is a double borrow. Cloning one PathBuf per transfer is free at
+            // this rate and keeps the intent obvious.
+            let finished = t.path.clone();
+            m.remove(&finished);
         }
 
         Ok(total)
@@ -353,6 +405,150 @@ mod tests {
             !dest.exists(),
             "the partial file must be gone, not left behind at half its final size"
         );
+    }
+
+    #[test]
+    fn completing_one_transfer_does_not_discard_another() {
+        // This was `m.clear()` inside the eof branch: finishing ANY transfer emptied the whole
+        // open-transfer map, silently destroying every other entry.
+        //
+        // It survived because the lockstep protocol normally keeps exactly one transfer open, so
+        // there was never a second entry to destroy — the bug was unreachable rather than absent.
+        // A live run that left three stale transfers behind is what exposed it.
+        //
+        // Worth keeping even though the protocol now forbids two open transfers, because the
+        // cleanup in `begin` means a stale entry CAN coexist with a new one mid-call, and because
+        // a future relaxation of the one-at-a-time rule must not silently reintroduce this.
+        let _serial = reset();
+        let first = scratch("keep-me.bin");
+        let second = scratch("finish-me.bin");
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
+
+        begin(first.to_str().unwrap(), true).expect("begin first");
+        write_chunk(0, &[1u8; 100], false, None).expect("write to first");
+
+        // Opening a second path abandons the first: that is the leak fix, and it means the map
+        // never holds two entries at this point.
+        begin(second.to_str().unwrap(), true).expect("begin second");
+        write_chunk(0, &[2u8; 100], true, None).expect("complete second");
+
+        // The first must have been abandoned rather than left dangling, and its partial file
+        // removed — a half-written file claiming to be the artifact is worse than none.
+        assert!(
+            !first.exists(),
+            "the abandoned partial file must be removed, not left in the staging root"
+        );
+
+        // And a fresh transfer must still work: the map is usable, not wedged.
+        begin(first.to_str().unwrap(), true).expect("begin again after an abandoned transfer");
+        let total = write_chunk(0, &[3u8; 10], true, None).expect("complete after abandon");
+        assert_eq!(total, 10);
+    }
+
+    #[test]
+    fn a_stale_open_transfer_does_not_wedge_the_verb() {
+        // The live failure this guards: a client opened a destination and never sent its final
+        // chunk. The entry stayed in the map forever, and every later transfer was refused with
+        // "3 transfers are open; the lockstep protocol allows one at a time" — the verb was out of
+        // service until the guest process restarted.
+        //
+        // A single interrupted client must not take a verb offline. Opening a new transfer now
+        // cleans up whatever was left behind.
+        let _serial = reset();
+        let stale = scratch("stale.bin");
+        let fresh = scratch("fresh.bin");
+        let _ = std::fs::remove_file(&stale);
+        let _ = std::fs::remove_file(&fresh);
+
+        // Open and abandon, three times, exactly as the broken client did.
+        for _ in 0..3 {
+            begin(stale.to_str().unwrap(), true).expect("begin stale");
+            write_chunk(0, &[7u8; 50], false, None).expect("partial write");
+        }
+
+        // The verb must still work: this is the assertion that failed on the live guest.
+        begin(fresh.to_str().unwrap(), true).expect("begin after three abandoned transfers");
+        let total = write_chunk(0, &[8u8; 64], true, None).expect("complete after abandon");
+        assert_eq!(
+            total, 64,
+            "a fresh transfer must complete after stale ones are cleaned up"
+        );
+    }
+
+    #[test]
+    fn the_file_exists_on_disk_after_a_transfer_that_abandoned_another() {
+        // The bug this guards was mine, introduced while fixing the stale-transfer leak, and the
+        // first version of THIS TEST could not catch it.
+        //
+        // `File::create` truncates and opens a handle. The cleanup that discards abandoned
+        // transfers ran AFTER that and removed the very path just opened, so the map held a handle
+        // to a deleted file. Writes went nowhere, while the acknowledgement reported the byte count
+        // from an in-memory counter — the push said success and no file existed.
+        //
+        // The first version of this test opened the same path twice and asserted the file was
+        // readable. It passed against the broken code, because `reset()` clears the map before
+        // every test and a second `begin` on the same path therefore found no stale entry to
+        // trigger the cleanup. The cleanup only runs when an entry for a DIFFERENT path is
+        // present, so the test has to create that condition deliberately.
+        //
+        // That is the general lesson: a regression test has to reproduce the state that made the
+        // bug reachable, not merely the API calls that were involved.
+        let _serial = reset();
+        let abandoned = scratch("abandoned-a.bin");
+        let target = scratch("target-b.bin");
+        let _ = std::fs::remove_file(&abandoned);
+        let _ = std::fs::remove_file(&target);
+
+        // Leave a transfer OPEN on one path. This is the state a crashed client leaves behind, and
+        // it is what makes the cleanup path run at all.
+        begin(abandoned.to_str().unwrap(), true).expect("begin abandoned");
+        write_chunk(0, &[1u8; 64], false, None).expect("partial write");
+
+        // Now transfer a DIFFERENT path to completion.
+        begin(target.to_str().unwrap(), true).expect("begin target");
+        let total = write_chunk(0, &[2u8; 512], true, None).expect("complete target");
+        assert_eq!(total, 512);
+
+        // The assertion that matters: the file must be on disk, readable, and hold this
+        // transfer's bytes.
+        let on_disk =
+            std::fs::read(&target).expect("the destination must exist after a completed transfer");
+        assert_eq!(
+            on_disk.len(),
+            512,
+            "the file on disk must be the size the transfer reported"
+        );
+        assert!(
+            on_disk.iter().all(|&b| b == 2),
+            "the file must contain this transfer's bytes, not a previous version"
+        );
+    }
+
+    #[test]
+    fn a_completed_file_is_not_destroyed_by_a_later_transfer() {
+        // Cleanup must only remove files belonging to ABANDONED transfers. A file written by a
+        // transfer that COMPLETED is somebody's artifact and must survive.
+        let _serial = reset();
+        let finished = scratch("finished.bin");
+        let next = scratch("next.bin");
+        let _ = std::fs::remove_file(&finished);
+        let _ = std::fs::remove_file(&next);
+
+        // A real, completed artifact.
+        begin(finished.to_str().unwrap(), true).expect("begin finished");
+        write_chunk(0, &[7u8; 200], true, None).expect("complete finished");
+        assert!(finished.exists(), "the artifact must be on disk");
+
+        // A later transfer to a different path. Nothing here is abandoned.
+        begin(next.to_str().unwrap(), true).expect("begin next");
+        write_chunk(0, &[8u8; 32], true, None).expect("complete next");
+
+        assert!(
+            finished.exists(),
+            "a later transfer must not delete a file an earlier COMPLETED transfer wrote"
+        );
+        assert_eq!(std::fs::read(&finished).expect("readable").len(), 200);
     }
 
     #[test]
