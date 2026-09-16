@@ -638,3 +638,127 @@ parked at a large explicit value instead, which is a better outcome anyway — a
 what it is beats one that is absent and indistinguishable from never having been set.
 
 ---
+
+## D-016 — Why `lifecycle` is still a stub, and what the two options cost
+
+**Date:** 2026-09-16
+**Status:** resolved — Option B taken, and the vmstate parameter was misunderstood
+
+**RESOLVED 2026-09-16.** Option B was implemented: the disk is declared with `-blockdev` and named
+nodes, and the guest boots with 12/12 probes passing.
+
+**The mistake that made this look impossible.** `vmstate` was assumed to be a SEPARATE block node
+holding RAM, so one was created (file node, then qcow2 node, then a pre-sized file — three
+variations). Every one failed with `vmstate block device 'X' does not exist`, *including for a node
+that `query-named-block-nodes` plainly listed as present and writable*. That contradiction is the
+tell that the parameter means something other than it appears to.
+
+**The actual signature, from QEMU's own QAPI documentation in `qapi/migration.json`:**
+
+```
+-> { "execute": "snapshot-save",
+     "arguments": {
+        "job-id": "snapsave0",
+        "tag": "my-snap",
+        "vmstate": "disk0",           <-- the DISK node itself
+        "devices": ["disk0", "disk1"]
+     }
+   }
+```
+
+**`vmstate` is the disk node.** The VM state is written INTO the disk's own qcow2 snapshot. There is
+no separate vmstate device to create, and creating one produces an error that describes a node as
+missing while it is visibly present.
+
+With the documented form it works on the first attempt:
+
+```
+job: created -> running -> waiting -> pending -> concluded
+error: None
+
+info snapshots:
+  ID   TAG          VM_SIZE      DATE
+  2    my-snap      3.37 GiB     2026-09-16 12:57:50      <- RAM included
+```
+
+Compare with the internal snapshot attempted before the disk was renamed, which reported `0 B` and
+could not be reverted while the VM was running. **`3.37 GiB` versus `0 B` is the whole difference
+between a disk revert point and a restorable machine.**
+
+**Process note.** Five forms were tried before reading the API documentation, and the first thing
+that should have been consulted was the QAPI definition — it contains a complete worked example. The
+correct order is: read the vendor's signature, then implement. Guessing at a parameter's meaning from
+its name cost more time here than any code in the project so far.
+
+**Context.** `lifecycle` is the last unimplemented verb. The assumption going in was that it is
+plumbing: open the QMP socket that `wvm-host` already supervises and dispatch the snapshot commands.
+Measurement says otherwise, so the findings are recorded here before any code is written.
+
+**Finding 1 — `savevm`/`loadvm` are not QMP commands.** Queried against the live socket:
+242 commands available, and neither appears. They are HMP commands. D-006 recorded this and chose
+`snapshot-save`/`snapshot-load` instead; that decision holds.
+
+**Finding 2 — `snapshot-save` needs a NAMED block node, and our disk has none.** It takes
+`job-id`, `tag`, `vmstate`, `devices`, where `devices` is a list of node names. The disk is declared
+with the legacy `-drive` interface:
+
+```
+-drive file=.../disk.qcow2,if=none,id=disk0,format=qcow2,...
+virtio-blk-pci,drive=disk0,bootindex=1
+```
+
+`-drive` produces an anonymous node — QEMU generates `#block172`. Passing the device id fails with
+`No block device node 'disk0'`; passing the generated name gets further but then fails with
+`vmstate block device '...' does not exist`, because `vmstate` must itself be a block node rather
+than a file path.
+
+**Finding 3 — the job abstraction hides the reason.** `snapshot-save` returns immediately and reports
+its outcome asynchronously as `JOB_STATUS_CHANGE` events. The failure sequence is
+`created → running → aborting → concluded`, and **none of those events carries the error**. The
+reason is only visible from `query-jobs`, which returns `error: "No block device node 'disk0'"`.
+Anyone reading the event stream alone would see a job abort with no explanation. This cost four
+attempts and a guessed device name before the error was found.
+
+**Finding 4 — internal snapshots work today, but are disk-only.** `blockdev-snapshot-internal-sync`
+takes a `device` rather than a node name and succeeded on the current VM:
+
+```
+info snapshots:
+  ID      TAG               VM_SIZE    DATE                 VM_CLOCK
+  --      wvm-internal-1       0 B     2026-09-16 12:39:37  0000:55:20.440
+```
+
+`VM_SIZE 0 B` is the tell, and attempting to revert to it confirms it:
+
+```
+loadvm wvm-internal-1
+  -> "Error: This is a disk-only snapshot. Revert to it offline using qemu-img"
+```
+
+So it captures **disk state only, with no RAM**, and cannot be restored while the VM is running. It
+is a revert point for a stopped guest, not a save-state.
+
+**Finding 5 — `loadvm` is reachable through `human-monitor-command`.** HMP is available over QMP with
+that one escape hatch, so the HMP-only verbs are not unreachable, only indirect. Worth knowing for
+any future verb in the same position.
+
+**The two options.**
+
+*Option A — internal snapshots, as they work today.* No change to the VM's disk declaration. Creates
+and deletes cleanly. **Cannot be restored live** and does not capture RAM, so "snapshot before
+something risky, restore after" does not work: it would mean stopping the guest to revert, which
+defeats the point of a control plane that exists to drive a running guest.
+
+*Option B — declare the disk with `-blockdev` instead of `-drive`.* Nodes become explicitly named, and
+full VM-state snapshots (`snapshot-save`/`snapshot-load`) become available with live restore and RAM
+captured. This is the modern QEMU interface and the one the async job API is built around. **The cost
+is that it changes how the guest's disk is declared, which touches the boot path** — the same path
+that took the virtio-net and two-CD-on-one-IDE deadlocks to get right. It needs a regression check
+that the guest still boots and that the existing 12 probes still pass, and it should be done as its
+own change with the VM stopped, not folded into a verb implementation.
+
+**Recommendation: Option B**, as a separate commit before `lifecycle` is written, because a
+lifecycle verb that cannot restore a running VM is not the thing the verb exists for. But it is a
+change to a working boot path, and that decision is Dave's rather than something to slip in.
+
+---

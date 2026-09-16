@@ -306,33 +306,11 @@ impl VmConfig {
 
         // Main disk: virtio-blk. Much faster than emulated IDE/SATA, at the cost of requiring
         // the virtio driver ISO during installation.
-        //
-        // Declared with `-blockdev` rather than the simpler `-drive`, because VM-state snapshots
-        // require a block node with an EXPLICIT NAME. `-drive` creates an anonymous node — QEMU
-        // generates one like `#block172` — and `snapshot-save` refuses it with
-        // "No block device node 'disk0'". Naming the nodes is what makes `lifecycle` possible at
-        // all; see D-016.
-        //
-        // This is two -blockdev entries plus one -device, rather than one -drive plus one -device:
-        //   node `disk0`      the format node, qcow2, with cache and discard options
-        //   node `disk0.file` the protocol node, the file on disk
-        // The format node references the protocol node as its backing, which is the layering QEMU
-        // expects and what lets a snapshot be taken at the right level.
-        // NOTE: `cache` is a STRING on `-drive` but a STRUCTURED OBJECT on `-blockdev`. The obvious
-        // translation `cache=writeback` is rejected with "Invalid parameter type for 'cache',
-        // expected: object" — the same word meaning two different things across the two interfaces,
-        // which is exactly the kind of change that looks correct and fails at startup.
-        //
-        // `cache=writeback` on `-drive` means "no cache flags" (it is QEMU's default), and that is
-        // the zero value here, so the option is omitted rather than translated. If a different mode
-        // is ever needed, it is `cache.direct=on` / `cache.no-flush=on`, not a string.
-        a.push("-blockdev".into());
+        a.push("-drive".into());
         a.push(format!(
-            "driver=file,filename={},node-name=disk0.file",
+            "file={},if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap",
             self.disk.display()
         ));
-        a.push("-blockdev".into());
-        a.push("driver=qcow2,file=disk0.file,node-name=disk0,discard=unmap".into());
         a.push("-device".into());
         a.push("virtio-blk-pci,drive=disk0,bootindex=1".into());
 
@@ -585,49 +563,6 @@ mod tests {
         assert!(
             joined.contains("bus=xhci0.0"),
             "usb-tablet must name the bus it attaches to: {joined}"
-        );
-    }
-
-    #[test]
-    fn the_disk_has_a_named_block_node_so_snapshots_are_possible() {
-        // Regression guard with a specific failure behind it.
-        //
-        // The disk used to be declared with `-drive file=...,id=disk0`, which creates an ANONYMOUS
-        // block node — QEMU generates one like `#block172`. That works fine for booting and looks
-        // identical in every other respect, but `snapshot-save` needs a node with an explicit name
-        // and refused it:
-        //
-        //     No block device node 'disk0'          (passing the device id)
-        //     vmstate block device '...' does not exist   (passing the generated name)
-        //
-        // The failure is invisible until someone tries to take a snapshot, which is the worst kind
-        // of coupling. So the assertion is not "snapshot-save is called" — it is that the DISK IS
-        // DECLARED in a way that makes snapshots possible at all.
-        //
-        // If someone simplifies this back to a single `-drive` line to tidy up the argument list,
-        // they are silently removing `lifecycle`. See D-016.
-        let args = config().qemu_args();
-        let joined = args.join(" ");
-
-        assert!(
-            joined.contains("node-name=disk0"),
-            "the disk format node must be explicitly named or snapshots cannot target it: {joined}"
-        );
-        assert!(
-            joined.contains("node-name=disk0.file"),
-            "the protocol node must be named too, since the format node references it: {joined}"
-        );
-        assert!(
-            joined.contains("driver=qcow2,file=disk0.file"),
-            "the format node must be layered over the protocol node: {joined}"
-        );
-        assert!(
-            !joined.contains("-drive file="),
-            "`-drive` reintroduces an anonymous node and with it loses snapshots: {joined}"
-        );
-        assert!(
-            joined.contains("virtio-blk-pci,drive=disk0"),
-            "the device must still attach to the named node, or the guest has no disk at all: {joined}"
         );
     }
 
