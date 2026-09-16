@@ -19,9 +19,9 @@ WinPodX, winapps, LinOffice all put individual Windows windows on a Linux deskto
 RemoteApp. WVM exists for the case they do not cover: **an agent or a program driving a Windows
 guest over a typed protocol, headless, with an auditable capability boundary.**
 
-**Status: M5 in progress.** `exec`, `capture`, `input`, `transfer push` and `transfer pull` are
-implemented and verified against a live guest. `lifecycle` is an honest stub that reports
-`not implemented in this build`.
+**Status: every verb implemented and verified against a live guest** — `exec`, `capture`, `input`,
+`transfer push`, `transfer pull`, and snapshots (save, restore, list, delete). Nothing in the
+protocol is a stub.
 
 ## The one command to run first
 
@@ -86,15 +86,20 @@ and hash-verified** — which is the difference between a sandbox and a roach mo
 | Capture | PNG of the live desktop, geometry assertion |
 | Input | absolute pointer moves and clicks, UK-correct keys and text |
 | Transfer | push and pull, chunked in lockstep, confined to a guest staging root |
+| Snapshots | save and restore **live**, RAM included — the guest rolls back, still running |
 
-## Not yet built
+## What the guest refuses, and why that is the answer
 
-The protocol has verbs the guest answers honestly rather than optimistically. This still returns
-`not implemented in this build`:
+One verb is answered with a refusal rather than an implementation, and the refusal is permanent:
 
-- **lifecycle** — snapshot and restore from the guest side
+- **`lifecycle` from inside the guest.** Snapshots are a hypervisor capability. The machine state
+  lives in QEMU and the guest has no view of its own hypervisor, so this can never work from that
+  side — it is not "not written yet".
 
-It has its plumbing in place and a test asserting a stub never reports success.
+The distinction is deliberate and tested. A caller told "not implemented" would reasonably retry
+after an upgrade; a caller told the truth stops asking and uses `wvm vm snapshot` on the host, which
+the message names. The protocol keeps the verb so the boundary is discoverable by asking, rather
+than by a connection timing out.
 
 ## Verifying it yourself
 
@@ -126,8 +131,13 @@ one — so they are wired together rather than left to whoever remembers to run 
 - **A guest without a display cannot be captured.** Capture runs against the QEMU framebuffer on the
   host, so it needs QEMU to be rendering. That is inherent, not a bug — and it is why capture is
   host-side at all (see D-009).
-- **`lifecycle` is not built.** Snapshot and restore from the guest side still return
-  `not implemented in this build`. The host-side equivalents work — see `docs/VM-CONFIG.md`.
+- **Snapshots need the VM running, and stop it briefly.** A save freezes the guest CPUs for a few
+  seconds while state is written — measured at ~6.5s on a 3.4 GiB machine. The QMP control channel
+  is silent during that window, which is why any client read timeout shorter than the pause fails
+  intermittently. The job loop here reads with a 60s timeout for exactly that reason.
+- **Snapshot size is the RAM, not the delta.** `my-snap` reports 3.37 GiB because it holds the
+  machine's memory as well as its disk. That is what makes a restore a rollback rather than a disk
+  revert, and it is also why snapshots are worth deleting when they are no longer needed.
 - **Input cannot reach every widget.** A page-level overlay that fights synthetic focus may take
   focus and still ignore injected keys. Ordinary Windows controls and browser chrome accept input
   reliably; this is recorded as an observed boundary rather than explained away.
@@ -241,7 +251,16 @@ wvm vm input    text  --config ~/wvm/wvm.toml 'hello from the host'
 # move a file in, and get an artifact back out
 wvm vm transfer push --config ~/wvm/wvm.toml ./payload.bin 'C:\ProgramData\wvm\staging\payload.bin'
 wvm vm transfer pull --config ~/wvm/wvm.toml 'C:\ProgramData\wvm\staging\result.bin' ./result.bin
+
+# snapshot before letting something risky run, and roll back after
+wvm vm snapshot save before-install --config ~/wvm/wvm.toml
+wvm vm snapshot list               --config ~/wvm/wvm.toml
+wvm vm snapshot restore before-install --config ~/wvm/wvm.toml
 ```
+
+A snapshot takes the machine's **memory as well as its disk**, so a restore returns the guest to the
+state it was in — running, with its windows open — not just to an earlier disk image. That is the
+difference between undoing something and reinstalling it.
 
 Note the argument order for `pull`: the names are written for a push, so they **invert**. `SOURCE`
 is the **guest** file being fetched and `GUEST_PATH` is the **host** destination. Getting it
