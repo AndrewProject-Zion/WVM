@@ -68,7 +68,7 @@ sequence, not a fault:
 ## Running it
 
 ```sh
-cd /home/andy/LSW
+cd the repo
 
 ./scripts/start-windows.sh              # with a window (gtk)
 ./scripts/start-windows.sh --headless   # no display

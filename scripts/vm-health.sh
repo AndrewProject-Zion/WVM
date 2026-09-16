@@ -46,7 +46,7 @@ fi
 echo
 
 echo "3. Screen capture"
-if python3 /home/andy/LSW/scripts/qmp_input.py "$SOCK" shot /tmp/wvm-health.ppm >/dev/null 2>&1; then
+if python3 "$(dirname "$0")/qmp_input.py" "$SOCK" shot /tmp/wvm-health.ppm >/dev/null 2>&1; then
     size=$(stat -c %s /tmp/wvm-health.ppm 2>/dev/null || echo 0)
     echo "   captured $size bytes"
 else

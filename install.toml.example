@@ -25,11 +25,12 @@ cpus = 4
 
 # -------------------------- EDIT THESE TWO PATHS --------------------------
 # The tiny11 ISO, wherever your browser saved it.
-install_iso = "/home/andy/Downloads/tiny11.iso"
+# Replace with your own ISO. `~` is expanded, so a relative-to-home path works.
+install_iso = "~/Downloads/tiny11.iso"
 
 # The virtio-win driver disc. Without this, Windows Setup reports NO DISKS,
 # because it has no in-box virtio driver. Attached read-only, never bootable.
-driver_iso = "/home/andy/wvm-images/virtio-win.iso"
+driver_iso = "~/wvm-images/virtio-win.iso"
 # ---------------------------------------------------------------------------
 
 firmware = "uefi"

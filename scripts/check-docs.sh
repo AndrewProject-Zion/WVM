@@ -6,7 +6,7 @@
 # the drift is caught when it happens rather than when someone relies on it.
 
 set -uo pipefail
-cd /home/andy/LSW || exit 1
+cd "$(dirname "$0")/.." || exit 1
 
 fail=0
 

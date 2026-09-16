@@ -6,7 +6,7 @@
 
 set -uo pipefail
 
-cd /home/andy/LSW || exit 1
+cd "$(dirname "$0")/.." || exit 1
 
 echo "=== git: recent commits ==="
 git log --oneline | head -8

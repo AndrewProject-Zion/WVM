@@ -62,5 +62,5 @@ done
 
 echo
 echo "Done. Start the VM with:"
-echo "  cd /home/andy/LSW"
-echo "  python3 scripts/vm-with-display.py --display gtk --cpu max /home/andy/wvm/install.toml"
+echo "  cd $(dirname "$0")/.."
+echo "  python3 scripts/vm-with-display.py --display gtk --cpu max ~/wvm/install.toml"

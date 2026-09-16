@@ -28,6 +28,7 @@ sequence that makes the tool a tool rather than a viewer.
 Usage:
     python3 scripts/make-demo-gif.py --out docs/demo.gif
 """
+from pathlib import Path
 import argparse
 import json
 import os
@@ -76,7 +77,7 @@ def call(port, req, timeout=120):
         s.close()
 
 
-QMP_SOCKET = "/home/andy/.local/state/wvm/w11/qmp.sock"
+QMP_SOCKET = str(Path.home() / ".local/state/wvm/w11/qmp.sock")
 
 
 class Qmp:

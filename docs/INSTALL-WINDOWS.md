@@ -7,9 +7,9 @@ runbook rather than a rediscovery.
 
 | Item | Path | Verified how |
 |---|---|---|
-| tiny11 2311 x64 | `/home/andy/Downloads/tiny11_2311_x64-ff.iso` | mounted read-only; label `TINY11_2311`, `install.esd` 2724 MiB with `MSWIM` magic, `boot.wim` 639 MiB, EFI boot files present |
-| virtio-win drivers | `/home/andy/wvm-images/virtio-win.iso` | fetched in chunks; size checked against `Content-Length` |
-| VM config | `/home/andy/wvm/install.toml` | `wvm vm validate` |
+| tiny11 2311 x64 | `~/Downloads/tiny11_2311_x64-ff.iso` | mounted read-only; label `TINY11_2311`, `install.esd` 2724 MiB with `MSWIM` magic, `boot.wim` 639 MiB, EFI boot files present |
+| virtio-win drivers | `~/wvm-images/virtio-win.iso` | fetched in chunks; size checked against `Content-Length` |
+| VM config | `~/wvm/install.toml` | `wvm vm validate` |
 
 ## Why the driver ISO is not optional
 

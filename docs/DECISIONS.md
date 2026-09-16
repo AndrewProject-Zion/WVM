@@ -10,10 +10,11 @@ Append-only. Superseding a decision means adding a new entry that references the
 **Date:** 2026-09-14
 **Status:** accepted
 
-**Context.** `reference/lsw-original` (ne0YT's *Linux Subsystem for Windows*) was reviewed as a
-candidate to rewrite in Rust. The entire system is ~420 lines of shell. Its core is a 38-line
-`windows.sh` that does four things: `VBoxManage` VM boot/resume, mount host `/` into the guest as
-`Z:\`, translate a POSIX path to a `Z:/` path, and run
+**Context.** ne0YT's *Linux Subsystem for Windows* was reviewed as a candidate to rewrite in Rust.
+Its code was removed from the tree before this repository went public — the attribution and the
+reasoning both live on, in `docs/ORIGIN.md` and below. The entire system is ~420 lines of shell. Its
+core is a 38-line `windows.sh` that does four things: `VBoxManage` VM boot/resume, mount host `/`
+into the guest as `Z:\`, translate a POSIX path to a `Z:/` path, and run
 `VBoxManage guestcontrol run --username admin --password $(cat vm_password.txt)`.
 
 **Findings.**

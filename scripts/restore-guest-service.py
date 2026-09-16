@@ -22,6 +22,7 @@ to be reinvented each time.
 
 Usage:  python3 scripts/restore-guest-service.py [--socket PATH]
 """
+from pathlib import Path
 import argparse
 import json
 import socket
@@ -124,7 +125,7 @@ def run_dialog(f, command, settle=1.5):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--socket", default="/home/andy/.local/state/wvm/w11/qmp.sock")
+    ap.add_argument("--socket", default=str(Path.home() / ".local/state/wvm/w11/qmp.sock"))
     args = ap.parse_args()
 
     s, f = connect(args.socket)

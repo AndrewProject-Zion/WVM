@@ -18,12 +18,13 @@ Usage:
 
 from __future__ import annotations
 
+from pathlib import Path
 import argparse
 import importlib.util
 import sys
 import time
 
-QMP_INPUT = "/home/andy/LSW/scripts/qmp_input.py"
+QMP_INPUT = str(Path(__file__).resolve().parent / "qmp_input.py")
 
 
 def load_helper(path):
@@ -43,7 +44,7 @@ def screenshot_via(qmp, path):
 
 def main(argv):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--socket", default="/home/andy/.local/state/wvm/w11/qmp.sock")
+    parser.add_argument("--socket", default=str(Path.home() / ".local/state/wvm/w11/qmp.sock"))
     parser.add_argument("--max", type=int, default=120, help="longest line to try")
     parser.add_argument("--delay", type=int, default=70, help="ms between keys")
     args = parser.parse_args(argv[1:])

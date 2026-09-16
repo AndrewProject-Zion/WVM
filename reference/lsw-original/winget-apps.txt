@@ -1,3 +1,0 @@
-winget install --id=JustinMaximillianKimlim.Xplorer  -e
-winget install --id=MullvadVPN.MullvadBrowser  -e
-winget install --id=voidtools.Everything  -e

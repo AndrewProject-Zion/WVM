@@ -8,6 +8,7 @@ process actually bound, because something replaced or recreated the path after b
 Walking /proc/net/unix is the way to settle it, since it reports the real bound inode.
 """
 
+from pathlib import Path
 import os
 import socket
 import sys
@@ -106,5 +107,5 @@ def main(path):
 
 
 if __name__ == "__main__":
-    target = sys.argv[1] if len(sys.argv) > 1 else "/home/andy/.local/state/wvm/w11/qmp.sock"
+    target = sys.argv[1] if len(sys.argv) > 1 else str(Path.home() / ".local/state/wvm/w11/qmp.sock")
     sys.exit(main(target))

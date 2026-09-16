@@ -11,8 +11,10 @@
 
 set -uo pipefail
 
-TINY=/home/andy/Downloads/tiny11_2311_x64-ff.iso
-DRV=/home/andy/wvm-images/virtio-win.iso
+# Override these for your machine. They are inputs to the probe, not assumptions about where
+# anything is installed.
+TINY=${TINY_ISO:-"$HOME/Downloads/tiny11.iso"}
+DRV=${VIRTIO_ISO:-"$HOME/wvm-images/virtio-win.iso"}
 
 probe() {
     local name="$1"; shift

@@ -172,7 +172,7 @@ click **Load driver → Browse → the driver disc → `viostor` → `w11` → `
 Complete the install through the GUI. Watch it with a window if you prefer:
 
 ```sh
-python3 scripts/vm-with-display.py --display gtk /home/andy/wvm/install.toml
+python3 scripts/vm-with-display.py --display gtk ~/wvm/install.toml
 ```
 
 ### 5. Boot the installed guest
@@ -285,7 +285,7 @@ that did not respond as expected, a guest mid-boot.
 
 ```sh
 ./scripts/start-windows.sh                    # GTK window on the host
-python3 scripts/vm-with-display.py --display vnc /home/andy/wvm/wvm.toml
+python3 scripts/vm-with-display.py --display vnc ~/wvm/wvm.toml
 ```
 
 For VNC, point Remmina (or any viewer) at `127.0.0.1:5900` — no password, so bind it to loopback
@@ -366,10 +366,9 @@ Recorded so they are not re-litigated. Full reasoning in `docs/DECISIONS.md`.
 wvm-ipc/     wire protocol and framing — shared by host and guest, so they cannot desync
 wvm-host/    the Linux daemon: CLI, QEMU supervision, control socket, policy gate, journal
 wvm-guest/   the Windows service: transport, dispatch, Win32 execution, path containment
-docs/        design record — decisions, verified environment, build plan, install status
+docs/        design record — decisions, verified environment, build plan, install status, origin
 scripts/     tooling, each written for a specific failure that cost time
 examples/    a dependency-free Python client, and an executable demonstration of the gate
-reference/   the original project this was seeded from, read-only
 ```
 
 ## The client
