@@ -6,7 +6,7 @@ members = ["wvm-ipc", "wvm-host", "wvm-guest"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/AndrewProject-Zion/wvm"
+repository = "https://github.com/AndrewProject-Zion/WVM"
 rust-version = "1.75"
 
 [workspace.dependencies]
