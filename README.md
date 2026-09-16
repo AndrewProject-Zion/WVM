@@ -71,7 +71,7 @@ It has its plumbing in place and a test asserting a stub never reports success.
 ./scripts/verify-all.sh --list       # what runs, and why
 ```
 
-Eleven probes, and a result with three states rather than two: **passed**, **failed**, and **could
+Twelve probes, and a result with three states rather than two: **passed**, **failed**, and **could
 not run**. That last one is not a pass. A probe that never executed has verified nothing, and
 conflating the two is how a build ships on the strength of a check that did not happen.
 
@@ -80,11 +80,12 @@ one — so they are wired together rather than left to whoever remembers to run 
 
 ## Known gaps, recorded rather than hidden
 
-- **A request that ignores its deadline still holds the channel.** The guest answers one request at a
-  time, and `exec` takes a caller-supplied timeout, so a hung command is bounded. But the general
-  case is not solved: a request that neither returns nor respects its own deadline occupies the
-  control channel until something kills it. A watchdog able to abandon a request without restarting
-  the service is the follow-up (D-013).
+- **A request that ignores its deadline no longer holds the channel.** Requests run under a fifteen
+  minute backstop and connections are served on their own threads, so a wedged request is abandoned
+  and the listener stays reachable (D-015). What is still true: **the abandoned work is not
+  cancelled** — Rust cannot safely cancel arbitrary code, so the worker runs to completion. The
+  channel is released; the guest's resources are not. A timeout reply says so rather than implying a
+  clean stop.
 - **The tree-kill has a microseconds-wide window.** The child is assigned to its job object
   immediately after `spawn`, so there is a moment where a process exists outside the job. Closing it
   needs `CREATE_SUSPENDED` + `AssignProcessToJobObject` + `ResumeThread`, which `std::process` does

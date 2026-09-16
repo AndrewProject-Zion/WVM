@@ -570,3 +570,70 @@ states — passed, failed, and **could not run** — because collapsing "could n
 the defect this whole entry is about. All eleven pass.
 
 ---
+
+## D-015 — No single request may hold the control channel
+
+**Date:** 2026-09-16
+**Status:** accepted, verified both ways against a live guest
+
+**Context.** `exec` takes a caller-supplied timeout, so a hung COMMAND is bounded. That is one verb,
+not the channel. The guest chose to serve one connection at a time, inline in the accept loop, so a
+request that never returned for any other reason — a bug, a blocking path, a verb added later with no
+timeout — held the connection, and the host could not tell a busy guest from a wedged one from a dead
+one, because all three look like silence.
+
+**Decision, in two halves — and the first half alone was not enough.**
+
+1. **A request deadline.** Requests run on a worker and are abandoned if they overrun
+   (`wvm-guest/src/deadline.rs`, default fifteen minutes, `WVM_REQUEST_DEADLINE_SECS` to override).
+   The reply says plainly that the abandoned work was **not** cancelled, because Rust cannot safely
+   cancel arbitrary code and it continues running. Claiming a clean stop would be a claim the guest
+   cannot support.
+
+2. **A thread per connection.** The first half fired correctly and answered the host — and the channel
+   was *still* unavailable, because `dispatch::serve` then loops back to read the next request on that
+   connection while the accept loop is still inside it. Measured: the first connection received a
+   well-formed timeout reply, and a second connection got **nothing for thirty seconds.**
+
+Bounded by `MAX_CONNECTIONS = 8`. "One thread per connection" with no ceiling is a
+resource-exhaustion bug waiting for a peer that opens sockets in a loop.
+
+**The measurement mistake worth recording.** Five attempts tested the WRONG PROCESS. A console guest
+was started with a short deadline on the assumption it would take over the port; the Windows service
+kept ownership, so every measurement was of a process running the default. The guest's own
+environment eventually said so:
+
+```
+guest env WVM_REQUEST_DEADLINE_SECS: ''          <- never set
+CommandLine : "...wvm-guest.exe" --service       <- the service, not the instance under test
+```
+
+Checking which process was being measured should have been the first step, not the fifth. The
+override is now applied with `setx /M` and the service restarted, so the process under test is
+provably the process serving the port.
+
+**Verification, both directions.** `scripts/verify-request-deadline.py` holds one connection busy and
+checks whether a second is still served — the property that matters, observable immediately, with no
+fifteen-minute wait:
+
+- Thread per connection: **6/6 second-connection requests answered, slowest 0.0s.**
+- Inline serving (the fix reverted): **2 timeouts, slowest 10.0s, 4/6** — the listener is blocked by
+  the connection it is serving.
+
+`scripts/test-request-deadline.py` additionally exercises the deadline itself end to end against a
+guest started with a short one, and asserts the reply names the deadline and states the work was not
+cancelled.
+
+**Consequence.** `scripts/clear-guest-deadline.py` exists to park the override somewhere harmless and
+restore the service failure policy, because a test that leaves `restart/3600000` turns every future
+crash into an hour of downtime, silently. It reports honestly when it cannot do what it was asked —
+which is how the `reg delete` limitation below was found.
+
+**Limit recorded.** The override variable cannot be **deleted** through the exec layer: the registry
+key is `...\Control\Session Manager\Environment` and its space does not survive. Quoted, `reg` takes
+the quote characters as part of the key name ("Invalid syntax"); unquoted, the path splits on the
+space; and `Session Manager` has no 8.3 short name. All three measured. The variable is therefore
+parked at a large explicit value instead, which is a better outcome anyway — an override that says
+what it is beats one that is absent and indistinguishable from never having been set.
+
+---

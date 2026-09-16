@@ -48,7 +48,38 @@ pub fn serve<C: Connection>(mut conn: C) -> Result<()> {
             }
         };
 
-        let response = handle(&request);
+        // Run the request under a deadline, so no single request can hold the channel forever.
+        //
+        // The guest serves one request at a time on this thread. `exec` bounds its own command, but
+        // that is one verb: a request that never returns for ANY other reason — a bug, a blocking
+        // path, an operation added later with no timeout of its own — holds the connection and the
+        // host cannot tell a busy guest from a wedged one from a dead one. See `deadline.rs`.
+        //
+        // The work runs on a worker thread and is abandoned rather than cancelled if it overruns.
+        // Rust has no safe way to cancel arbitrary code, so the thread keeps going. That is stated
+        // in the reply rather than implied away: the host is told the request timed out, not told
+        // that the work was stopped, because only one of those is true.
+        let response = match crate::deadline::with_deadline(crate::deadline::request_deadline(), {
+            let request = request.clone();
+            move || handle(&request)
+        }) {
+            Ok(response) => response,
+            Err(elapsed) => {
+                crate::log::probe(&format!(
+                    "request exceeded the {:?} deadline and was abandoned; its work may still be \
+                     running",
+                    elapsed
+                ));
+                Response::Error {
+                    message: format!(
+                        "the guest did not finish this request within {:?} and stopped waiting for \
+                         it. The channel is usable again. The abandoned work was NOT cancelled and \
+                         may still be running.",
+                        elapsed
+                    ),
+                }
+            }
+        };
         respond(&mut conn, &response)?;
 
         // A handshake that names a different protocol version ends the session: continuing

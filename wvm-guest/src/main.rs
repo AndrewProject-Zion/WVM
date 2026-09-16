@@ -16,6 +16,7 @@
 mod base64;
 mod capture;
 mod chunk;
+mod deadline;
 mod dispatch;
 mod fsio;
 mod job;
@@ -30,6 +31,7 @@ mod win32;
 mod service;
 
 use anyhow::Result;
+use std::sync::atomic::Ordering;
 
 fn main() -> Result<()> {
     // Route the shared crate's framing diagnostics into this binary's log file.
@@ -78,6 +80,17 @@ fn main() -> Result<()> {
 ///
 /// So the listener is non-blocking and the loop polls. `should_stop` is consulted between attempts,
 /// which bounds how long a stop takes to roughly the poll interval rather than never.
+/// How many connections may be served at once.
+///
+/// The control channel expects ONE peer, so this is generous for the real case and exists purely as
+/// a ceiling. "One thread per connection" with no bound is a resource-exhaustion bug: a peer that
+/// opens sockets in a loop would spawn a thread for each until the guest died. Eight is enough for a
+/// client retrying while an abandoned worker is still finishing.
+const MAX_CONNECTIONS: usize = 8;
+
+/// Connections currently being served. Incremented on accept, decremented when the thread ends.
+static ACTIVE_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub fn serve_loop<F, S>(addr: &str, on_ready: F, should_stop: S) -> Result<()>
 where
     F: FnOnce(&str),
@@ -102,9 +115,41 @@ where
 
         match listener.accept() {
             Ok(Some(conn)) => {
-                if let Err(e) = dispatch::serve(conn) {
-                    eprintln!("wvm-guest: connection ended: {e}");
+                // Serve the connection on its OWN thread, so the accept loop stays reachable.
+                //
+                // This is the second half of the request-deadline work, and the first half alone was
+                // not enough. `dispatch::serve` now abandons a request that overruns its deadline
+                // and answers the host — but `serve` then loops back to read the NEXT request on
+                // that same connection, and while it is doing that the accept loop is still inside
+                // it. A wedged connection therefore kept the listener blocked even though the
+                // deadline had fired correctly and the host had been told about it.
+                //
+                // Measured: the first connection received a well-formed timeout reply, and a
+                // second connection got nothing at all for 30 seconds. The response was right and
+                // the channel was still unavailable, which is the more useful of the two
+                // observations and the reason the probe checks BOTH.
+                //
+                // So the unit of concurrency is the CONNECTION, not the request. A thread per
+                // connection is what lets a new client reach the guest while an abandoned worker is
+                // still running. The cost is one thread per connected client, which is acceptable
+                // for a control channel with a single expected peer — and it is bounded by
+                // `MAX_CONNECTIONS` below rather than unbounded, because "one thread per
+                // connection" with no ceiling is a resource-exhaustion bug waiting for a hostile
+                // peer to open ten thousand of them.
+                if ACTIVE_CONNECTIONS.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    crate::log::probe(&format!(
+                        "refusing a connection: {MAX_CONNECTIONS} are already being served"
+                    ));
+                    drop(conn);
+                    continue;
                 }
+                ACTIVE_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    if let Err(e) = dispatch::serve(conn) {
+                        eprintln!("wvm-guest: connection ended: {e}");
+                    }
+                    ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+                });
             }
             // Nothing pending: normal for a non-blocking listener.
             Ok(None) => std::thread::sleep(POLL),
