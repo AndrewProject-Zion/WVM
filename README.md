@@ -88,12 +88,15 @@ guest that steals focus or holds an elevation prompt cannot lock the agent out o
 The honest limit: driving an elevated (UAC) prompt through emulated input is unreliable in practice,
 and when a step needs a human at a screen, use the human.
 
-**And rollback is real but not free — read this one carefully.** `snapshot-save` writes the guest's
-entire RAM into its own disk with roughly 28 MB/s of throughput while the vCPUs are frozen, so a
-save is tens of seconds, not sub-second; `snapshot-load` returns in about 3 seconds. A save can also
-bugcheck our guest, which is open as issue #1 with the full evidence attached. It is a genuinely
-useful primitive — WSL's answer is a cold boot — and it is not a safety net you should reach for
-mid-task without knowing that.
+**And rollback is real but not free — read this one carefully, because it is the row most likely
+to disappoint you.** A save freezes the guest's CPUs while its memory is written into the disk, and
+the freeze **grows with the number of snapshots the disk already carries**: D-017 measured 6.5
+seconds on a fresh disk and 57 seconds with nine present, on the same guest. It is not sub-second,
+it is not atomic, and `snapshot-load` takes about 3 seconds to come back. A save can also bugcheck
+our guest — that is open issue #1, with the full evidence attached.
+
+It is still a genuinely useful primitive, and better than WSL's answer, which is a cold boot. It is
+not a safety net to reach for mid-task without knowing what it costs.
 
 ## What that looks like in practice
 
@@ -293,6 +296,17 @@ one — so they are wired together rather than left to whoever remembers to run 
 
 This walks from a bare Linux host to driving a Windows guest. It takes about an hour, most of it
 the Windows install.
+
+Every command below is written as bare `wvm`. Build it and put it on your PATH once, or you will
+hit `Command 'wvm' not found` on the very first line:
+
+```sh
+cargo build --release
+sudo install -m 0755 target/release/wvm /usr/local/bin/wvm   # or ~/.local/bin/wvm, no sudo
+```
+
+If you are working on the host only, you can skip the Windows install further down and point the
+config at an existing guest image.
 
 ### 0. What you need
 
