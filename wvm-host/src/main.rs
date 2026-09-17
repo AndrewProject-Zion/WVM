@@ -201,15 +201,6 @@ enum VmAction {
         overwrite: bool,
     },
 
-    /// Snapshot, restore and list VM state.
-    ///
-    /// A snapshot writes the machine's RAM and device state INTO the disk's own qcow2 as an
-    /// internal snapshot. It is not a disk-only revert point: restoring returns the guest to the
-    /// running state it was in, which is what makes this useful before letting an agent do
-    /// something it might need to undo.
-    ///
-    /// Requires the VM to be running — QEMU holds the state, so this is a QMP operation against a
-    /// live hypervisor.
     /// Put the guest's desktop on screen, on request: `show`, `hide` or `status`.
     ///
     /// Separate from `start` on purpose. The display server always exists (D-021), so this only
@@ -224,6 +215,15 @@ enum VmAction {
         action: String,
     },
 
+    /// Snapshot, restore and list VM state.
+    ///
+    /// A snapshot writes the machine's RAM and device state INTO the disk's own qcow2 as an
+    /// internal snapshot. It is not a disk-only revert point: restoring returns the guest to the
+    /// running state it was in, which is what makes this useful before letting an agent do
+    /// something it might need to undo.
+    ///
+    /// Requires the VM to be running — QEMU holds the state, so this is a QMP operation against a
+    /// live hypervisor.
     Snapshot {
         #[arg(long, default_value = "wvm.toml", global = true)]
         config: std::path::PathBuf,
