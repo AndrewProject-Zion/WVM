@@ -305,6 +305,45 @@ enum CallRequest {
     Inspect,
 }
 
+/// Is the guest's service answering? A one-shot hello over the control channel, nothing more.
+///
+/// WHY THIS EXISTS — a snapshot can crash the guest while reporting success (D-018). The snapshot
+/// genuinely did succeed; it is the machine that is now blue-screening. A caller who reads "saved"
+/// has no reason to look any further, so the worst possible outcome is the one the tool currently
+/// produces: a confident success message over a dead guest.
+///
+/// The comparison is what makes it meaningful. A guest that was already silent — stopped for
+/// maintenance, service not running — is not evidence about this save, so the caller asks twice and
+/// only reports a change.
+fn guest_answering(addr: &str) -> bool {
+    matches!(
+        guestclient::request(
+            addr,
+            &wvm_ipc::Request::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client: "wvm-liveness".to_string(),
+            }
+        ),
+        Ok(wvm_ipc::Response::Ready { .. })
+    )
+}
+
+/// Wait for the guest to answer, up to `deadline`.
+///
+/// A save freezes the vCPUs while state is written, so the guest does NOT answer immediately
+/// afterwards — measured at 57 seconds on a disk carrying snapshots. Reporting a crash on the first
+/// silent probe would turn every large save into a false alarm, which is worse than no check.
+fn wait_for_guest(addr: &str, deadline: std::time::Duration) -> std::time::Duration {
+    let start = std::time::Instant::now();
+    while start.elapsed() < deadline {
+        if guest_answering(addr) {
+            return start.elapsed();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+    start.elapsed()
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -661,30 +700,93 @@ fn run_vm(action: VmAction) -> Result<()> {
 writes, and it can take a minute or more on a disk carrying snapshots. That freeze is expected; \
 a timeout here does not mean the save failed."
                     );
+                    let addr = format!("127.0.0.1:{}", config.forward_port);
+                    let was_answering = guest_answering(&addr);
+
+                    // Warn about an accumulating disk BEFORE the save, while the caller can still
+                    // act on it. Two measured reasons: the guest freeze grows with the number of
+                    // snapshots (6.5 seconds on a fresh disk, 57 seconds with nine), and every
+                    // crash observed so far has been on a disk carrying many. Neither is guessed at
+                    // — both are in D-017 and D-018.
+                    if let Ok(existing) = lifecycle::list(&mut qmp) {
+                        if existing.len() > 2 {
+                            println!(
+                                concat!(
+                                    "  note: this disk already holds {} snapshots. Saves get slower ",
+                                    "as they accumulate — the guest froze for 57s with nine, against ",
+                                    "6.5s on a fresh disk — and that is also the state in which ",
+                                    "crashes have been observed. `wvm vm snapshot delete <tag>` ",
+                                    "reclaims one."
+                                ),
+                                existing.len()
+                            );
+                        }
+                    }
+
                     let s = lifecycle::save(&mut qmp, tag)?;
                     println!(
                         "  saved '{tag}' — {} of machine state (RAM and devices)",
                         human_size(s.vm_size_bytes)
                     );
-                    // Say this rather than let it be discovered as a mystery timeout. The save
-                    // freezes the vCPUs while it writes, and the guest can stay unresponsive for a
-                    // while afterwards — long enough that a caller whose next command times out
-                    // would reasonably conclude the snapshot broke the machine.
-                    println!(
-                        "  the guest may stay unresponsive for a moment while it catches up; \
-that is the freeze ending, not a failure"
-                    );
+
+                    // Do not stop at "the snapshot succeeded". Ask the machine whether it is still
+                    // there, because a save has been observed to bugcheck the guest while the
+                    // snapshot itself completes perfectly (D-018).
+                    if was_answering {
+                        let waited = wait_for_guest(&addr, std::time::Duration::from_secs(240));
+                        if waited >= std::time::Duration::from_secs(240) {
+                            anyhow::bail!(concat!(
+                                "the snapshot was written, BUT THE GUEST HAS NOT ANSWERED IN ",
+                                "240 SECONDS. It may have bugchecked — this is the failure ",
+                                "recorded in D-018, and an ordinary freeze does not look like ",
+                                "this. Check C:\\Windows\\Minidump inside the guest before ",
+                                "trusting the machine."
+                            ));
+                        }
+                        if waited > std::time::Duration::from_secs(20) {
+                            println!(
+                                "  guest answering again after {:.0}s — that was the freeze ending",
+                                waited.as_secs_f32()
+                            );
+                        }
+                    }
                 }
                 "restore" => {
                     let tag = tag
                         .as_deref()
                         .context("name the snapshot to restore: `wvm vm snapshot restore <tag>`")?;
+                    let addr = format!("127.0.0.1:{}", config.forward_port);
+                    let was_answering = guest_answering(&addr);
+
                     println!("restoring '{tag}' — the guest will roll back to that moment");
                     lifecycle::restore(&mut qmp, tag)?;
                     println!("  restored '{tag}'");
-                    println!(
-                        "  the guest is still running; anything written since the snapshot is gone"
-                    );
+
+                    // This used to ASSERT "the guest is still running". It was observed printing
+                    // that sentence at a machine which was blue-screening at the time (D-018).
+                    // Asserting a fact the code has not checked is how a caller ends up trusting a
+                    // dead guest, so the line now reports a measurement instead.
+                    if !was_answering {
+                        println!(
+                            "  the guest was not answering before the restore, so no claim is made \
+                             about it now — anything written since the snapshot is still gone"
+                        );
+                    } else {
+                        let waited = wait_for_guest(&addr, std::time::Duration::from_secs(240));
+                        if waited >= std::time::Duration::from_secs(240) {
+                            anyhow::bail!(concat!(
+                                "the snapshot loaded, BUT THE GUEST HAS NOT ANSWERED IN 240 ",
+                                "SECONDS. It may have bugchecked — see D-018. Check ",
+                                "C:\\Windows\\Minidump inside the guest before trusting the ",
+                                "machine."
+                            ));
+                        }
+                        println!(
+                            "  guest is running again ({:.0}s) and anything written since the \
+                             snapshot is gone",
+                            waited.as_secs_f32()
+                        );
+                    }
                 }
                 "delete" => {
                     let tag = tag

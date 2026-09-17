@@ -929,3 +929,79 @@ the order of ten to fifteen saves per arm, and a stated decision rule beforehand
 exactly the kind of confident wrong answer this project keeps having to dig out of its comments.
 
 **Reversal cost.** None for the diagnosis. The workarounds above are one-line config changes.
+
+### D-018 addendum — a full round of eliminations, and the mitigations that shipped
+
+**Date:** 2026-09-17, later the same session
+
+**Every trigger tested in isolation came back CLEAN.**
+
+| Test | Rounds | Crashes |
+|---|---|---|
+| `stop` / `cont`, 60s paused, no snapshot | 1 | 0 |
+| save only, then delete (idle guest) | 4 | 0 |
+| save only, **under sustained guest disk I/O** (7–9 MB/s confirmed from the host) | 4 | 0 |
+| restore only, repeatedly, quiet guest | 10 | 0 |
+| forced TRIM, including one full-volume retrim taking 85.9s | 3 | 0 |
+| save **and** restore, on a fresh overlay | 3+ | 0 |
+
+**What that establishes.** No single operation reproduces it. Save alone does not, restore alone does
+not, discarding does not, and a long vCPU pause does not. Yet it happened four times. The
+distinguishing feature of every crash is not the operation — it is **the disk it happened on**.
+
+**All four crashes were on `disk.qcow2` while it carried many internal snapshots** — up to thirteen,
+accompanied by 38% fragmentation, four leaked clusters, and saves that wrote at 28 MB/s where the
+same disk does 746 MB/s without copy-on-write. The one condition under which it has not yet
+reproduced is the same operations on a clean disk.
+
+That is an inference about a *condition*, not a proven cause, and it is recorded as one. It also
+means the earlier probes were not wrong — they were testing the wrong variable. Testing save and
+restore separately was still the right move; it simply showed the operation is not the trigger.
+
+**Two things shipped, because both are worth having whatever the root cause turns out to be:**
+
+1. **`snapshot save` and `snapshot restore` now VERIFY THE GUEST IS STILL THERE.**
+
+   This existed before: `save` printed "saved '<tag>' — N GiB of machine state" and `restore` printed
+   *"the guest is still running"*. Both were observed printing at a machine that was blue-screening
+   at the time. An assertion the code has not checked is worse than no message, because it is the
+   reason nobody looks.
+
+   Now the guest is asked before and after, and only a *change* is reported — a guest that was
+   already silent is not evidence about this command. If it stops answering, the command fails with
+   a message that names the dump directory, instead of reporting success over a dead machine.
+
+2. **A save warns when the disk already carries many snapshots**, before it runs, naming the command
+   that frees them. The freeze and the observed crash risk both grow with that count, and the
+   measurement is in the message.
+
+**Still open:** the root cause. The honest position is that this is a QEMU/Windows interaction this
+project cannot fix from its own code, it is now non-silent, and the two cheap hypervisor-side
+candidates remain untested for want of a reliable reproduction to test them against.
+
+## D-019 — Experiments run against an overlay, never the base disk
+
+**Date:** 2026-09-17
+**Status:** adopted
+
+`~/wvm/w11/disk.qcow2` is 76 GB and is the only copy of the Windows install on this machine.
+Nothing matching it exists in `/mnt/Zion_Vault`, which makes every experiment that touches the disk
+declaration a coin-flip on a full Windows reinstall.
+
+An ephemeral overlay removes that risk for nothing:
+
+```sh
+qemu-img create -f qcow2 -b ~/wvm/w11/disk.qcow2 -F qcow2 ~/wvm/w11/test_overlay.qcow2
+```
+
+`wvm-test.toml` points at the overlay; the guest sees the base unchanged, every write lands in the
+layer, and `rm` on the overlay restores the original state exactly. Crash dumps, filesystem damage
+and half-finished experiments all go in the bin with it.
+
+**Assumption corrected by testing.** The overlay was initially dismissed on the grounds that internal
+snapshots cannot exist on a qcow2 with a backing file — which would have made it useless for testing
+the one feature that matters here. That is wrong: `qemu-img snapshot -c` on an overlay succeeds and
+lists. The claim was checked in ten seconds and the overlay is in use.
+
+**Rule.** Any experiment that changes the disk device, its options, or its format runs on an overlay.
+The base disk is read-only in practice, whatever the file permissions say.

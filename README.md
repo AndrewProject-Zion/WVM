@@ -23,13 +23,21 @@ guest over a typed protocol, headless, with an auditable capability boundary.**
 `transfer push`, `transfer pull`, and snapshots (save, restore, list, delete). Nothing in the
 protocol is a stub.
 
-> **Snapshots carry a known risk.** On this Windows 11 build, roughly one `snapshot save` in five
-> bugchecks the guest with `0x50 PAGE_FAULT_IN_NONPAGED_AREA`. The fault is inside Windows' own
-> kernel — a fixed code offset relative to `PsLoadedModuleList` across four crashes with different
-> KASLR bases — and a bare vCPU pause of the same duration does **not** reproduce it, so it is the
-> snapshot's device-state write rather than the freeze. It is reproduced, localised and not yet
-> fixed. **Do not put anything in a snapshot you cannot afford to lose.** See D-017 and D-018 in
-> [`docs/DECISIONS.md`](docs/DECISIONS.md) for the measurements.
+> **Snapshots carry a known risk.** On this Windows 11 build a `snapshot save` has bugchecked the
+> guest with `0x50 PAGE_FAULT_IN_NONPAGED_AREA` — four times, with identical parameters, faulting at
+> a fixed code offset inside Windows' own kernel.
+>
+> **No single operation reproduces it.** A 60-second vCPU pause does not. Saving alone does not
+> (4 rounds, plus 4 more under sustained guest disk I/O). Restoring alone does not (10 rounds). A
+> forced full-volume TRIM does not (3 rounds). Every crash happened on a disk carrying many internal
+> snapshots — up to thirteen, at 38% fragmentation — and these same cycles have not yet reproduced it
+> on a clean disk. That is an inference about a condition, not a proven cause.
+>
+> Two things follow. `save` and `restore` now **verify the guest is still there** before reporting
+> success, so this can no longer happen quietly — it previously printed "saved" and "the guest is
+> still running" at a machine that was blue-screening. And `save` **warns when the disk already
+> carries many snapshots**, naming the command that frees them. Both are recorded, with every
+> elimination, in D-017 and D-018 of [`docs/DECISIONS.md`](docs/DECISIONS.md).
 
 ## If you are an agent, start here
 
