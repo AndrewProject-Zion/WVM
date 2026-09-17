@@ -600,6 +600,30 @@ impl Supervisor {
         std::fs::create_dir_all(self.config.state_dir())
             .with_context(|| format!("creating {}", self.config.state_dir().display()))?;
 
+        // The runtime directory for the DISPLAY socket, created 0700 EXPLICITLY rather than
+        // inherited.
+        //
+        // Two reasons this is its own step. QEMU cannot bind a socket in a directory that does not
+        // exist, and it would fail the whole launch rather than just the display -- and on a fresh
+        // boot this directory is absent, because /run/user is a tmpfs. And `create_dir_all` alone
+        // inherits the umask, which on this host yields 775: group-traversable. For a socket with
+        // no authentication that permission IS the authentication, so it is set here rather than
+        // assumed from a default.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            let dir = crate::vm::runtime_dir().join("wvm");
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
+            // `mode` only applies to directories DirBuilder actually creates; a pre-existing one
+            // keeps whatever it had. So the permission is asserted, not merely requested.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("securing {}", dir.display()))?;
+        }
+
         if !self.config.disk.exists() {
             // The disk's parent is NOT necessarily the state directory. An earlier version created
             // only the state directory and then failed with "No such file or directory" from

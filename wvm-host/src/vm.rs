@@ -11,8 +11,25 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// The per-user directory this user's VM runtime files live in.
+///
+/// `$XDG_RUNTIME_DIR` when set -- per-user and mode 0700 on every systemd host, which is what makes
+/// an unauthenticated socket inside it defensible -- otherwise a path under the state directory.
+/// Shared with the control socket so both agree on one policy instead of two fallback chains that
+/// drift apart.
+pub fn runtime_dir() -> PathBuf {
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(runtime);
+    }
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
 /// A VM definition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+
 pub struct VmConfig {
     /// Display name, used in the journal and for the QEMU `-name` argument.
     pub name: String,
@@ -262,6 +279,25 @@ impl VmConfig {
         self.state_dir().join("qmp.sock")
     }
 
+    /// The SPICE socket the on-demand viewer attaches to.
+    ///
+    /// In the per-user RUNTIME directory rather than beside the QMP socket, and that placement is
+    /// the security model rather than a preference. `disable-ticketing=on` means this display
+    /// server has NO authentication: the only thing between another local process and a live
+    /// Windows desktop is who can traverse the socket's parent directory.
+    ///
+    /// Measured on this host: `~/.local/state/wvm/w11` is mode 775 -- group-traversable -- while
+    /// `$XDG_RUNTIME_DIR` is 0700. So the display socket goes in the 0700 tree, and `prepare()`
+    /// creates that directory 0700 explicitly rather than inheriting the umask.
+    ///
+    /// The QMP socket keeps its 775 home. Not a claim that it is fine -- a group-writable QMP
+    /// socket is full control of the VM -- only that it predates this work; see D-022.
+    pub fn spice_socket(&self) -> PathBuf {
+        runtime_dir()
+            .join("wvm")
+            .join(format!("{}.spice.sock", self.name))
+    }
+
     /// Serial console log. QEMU writes boot output here; it is the first place to look when a VM
     /// fails to start, and it exists whether or not a display is attached.
     pub fn serial_log(&self) -> PathBuf {
@@ -430,6 +466,25 @@ impl VmConfig {
         // desktop session being present.
         a.push("-display".into());
         a.push("none".into());
+
+        // A SPICE server, so the desktop becomes viewable ON REQUEST while the machine stays
+        // headless.
+        //
+        // `-display none` still applies, and the combination is the point: it means "no local GUI
+        // inside the QEMU process", which is what makes a viewer attachable AND detachable. A GTK
+        // display lives inside QEMU and cannot be closed without closing the VM -- the situation
+        // this replaces. D-021 measured why an always-on server is acceptable: 0 ticks of CPU over
+        // 30s with nobody attached, against a positive control that proves the probe can see CPU.
+        //
+        // Bound to a UNIX SOCKET, never a TCP port. This is the security property of the feature.
+        // `disable-ticketing=on` disables authentication entirely, which is defensible only because
+        // a unix socket is reachable solely by processes that can traverse its 0700 parent. On a
+        // TCP port this would publish a Windows desktop to every interface, with no password.
+        a.push("-spice".into());
+        a.push(format!(
+            "unix=on,addr={},disable-ticketing=on",
+            self.spice_socket().display()
+        ));
 
         // Serial console to a file: the boot log exists whether or not anyone is watching.
         a.push("-serial".into());
@@ -673,6 +728,32 @@ mod tests {
             joined.contains("-display none"),
             "must not require a display"
         );
+    }
+
+    #[test]
+    fn the_display_server_is_a_unix_socket_and_never_a_tcp_port() {
+        // The security property of the whole feature, asserted rather than trusted.
+        //
+        // `disable-ticketing=on` means this display server has NO authentication -- the socket is
+        // the only gate. On a TCP port that would publish a live Windows desktop to every
+        // interface with nothing in front of it. So what is checked is the SHAPE of the argument,
+        // not merely that "-spice" appears somewhere in the command line.
+        let joined = config().qemu_args().join(" ");
+        assert!(joined.contains("-spice"), "no display server at all: {joined}");
+        assert!(joined.contains("unix=on"), "must bind a unix socket: {joined}");
+        assert!(
+            joined.contains("wvm/w11.spice.sock"),
+            "the socket must live in the per-user runtime tree: {joined}"
+        );
+        assert!(!joined.contains("port="), "must not bind a TCP port: {joined}");
+        assert!(
+            !joined.contains("addr=0.0.0.0"),
+            "must not bind all interfaces: {joined}"
+        );
+        // Headless has to survive alongside it: the server is added TO `-display none`, not
+        // instead of it. Losing that would make the VM need a desktop session to start at all --
+        // which is the thing D-004 exists to prevent.
+        assert!(joined.contains("-display none"), "headless was lost: {joined}");
     }
 
     #[test]

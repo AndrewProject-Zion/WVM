@@ -32,14 +32,9 @@ use crate::policy::{self, Allowlist};
 /// Where the control socket lives. Under `$XDG_RUNTIME_DIR` when available (which is per-user
 /// and already permissioned), otherwise a path under the state directory.
 pub fn default_socket_path() -> PathBuf {
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("wvm").join("control.sock");
-    }
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("wvm").join("control.sock")
+    // Delegate to the shared policy rather than repeating it: the display socket must make exactly
+    // the same choice, and two copies of a fallback chain drift apart.
+    crate::vm::runtime_dir().join("wvm").join("control.sock")
 }
 
 /// Server configuration.
