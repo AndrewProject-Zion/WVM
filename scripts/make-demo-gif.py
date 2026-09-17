@@ -377,6 +377,41 @@ def run_demo(port, workdir):
     show("artifact collected")
     frames.append((f, shot("04-pull")))
 
+    # --- step 5: the desktop is a view, not the interface ---
+    #
+    # The proof lives on the TERMINAL side, deliberately. The guest's screen does not change when a
+    # viewer attaches or detaches, so this frame's right half is identical to the last one -- which
+    # IS the point: nothing about the machine changed. What has to be legible is that a window
+    # appeared, went away, and the guest carried on answering.
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config = os.path.expanduser("~/wvm/wvm.toml")
+
+    def display(action):
+        r = subprocess.run(["./target/release/wvm", "vm", "display", action, "--config", config],
+                           capture_output=True, text=True, cwd=repo, timeout=90)
+        return (r.stdout or r.stderr or "").strip().splitlines()
+
+    f = Frame()
+    f.add("$ wvm vm display show       # a window onto the running guest", ACCENT)
+    for line in display("show")[:2]:
+        f.add("  " + line.strip(), OK)
+    time.sleep(7)  # let it actually paint before closing it
+    f.add("")
+    f.add("$ wvm vm display hide       # gone again", ACCENT)
+    for line in display("hide")[:1]:
+        f.add("  " + line.strip(), OK)
+    f.add("")
+    f.add("$ wvm vm exec -- cmd.exe /c ver    # is the machine still there?", ACCENT)
+    still = call(port, {"op": "exec", "program": "cmd.exe", "args": ["/c", "ver"],
+                        "cwd": None, "require_allowlist": False, "timeout_ms": 20000})
+    out = ((still or {}).get("payload", {}) or {}).get("stdout", "")
+    version = next((l.strip() for l in out.splitlines() if "Version" in l), "")
+    f.add("  " + (version or "(no answer)"), OK)
+    f.add("")
+    f.add("  the window is an ordinary process. The VM never noticed.", ACCENT)
+    show("still running")
+    frames.append((f, shot("05-display")))
+
     return frames
 
 
@@ -431,8 +466,26 @@ def main():
         rendered.append(out)
         print(f"  rendered {out}")
 
-    # A GIF needs the frames held long enough to read. Two seconds each, and the last one longer so
-    # the hash comparison is legible.
+    # HOW LONG TO HOLD EACH FRAME, which is not the same for all of them.
+    #
+    # This used one rate (1/2.6) for every frame. Fine for a frame carrying four lines, far too fast
+    # for one carrying twenty -- and the transcript ACCUMULATES, so the later and more interesting
+    # steps were exactly the ones nobody could read.
+    #
+    # Done by repeating a frame rather than by per-frame timestamps: the existing pipeline is
+    # already proven to emit one output frame per input, and a repeated input is that same
+    # mechanism with no new assumption about how ffmpeg treats durations on stills.
+    # MEASURED, not assumed. The first attempt at this used a single input rate, and the GIF came
+    # out with every frame held 1 centisecond -- a tenth of a second for the whole animation, which
+    # is the "flashes past too fast to read" that was reported. `-r` before the inputs sets the
+    # INPUT rate; with no output rate the encoder collapses the timestamps. An explicit output rate
+    # is worse, not better: tested on six inputs it silently DROPPED five of them.
+    #
+    # What works is the concat demuxer's own per-file `duration` directive, verified on three test
+    # frames to yield 300/500/200 centiseconds exactly as asked. So the frames are held by
+    # timestamp, and the hold is proportional to how much there is to read.
+    LINES_PER_SECOND = 2.0
+    MIN_SECONDS, MAX_SECONDS = 3.0, 10.0
     out_path = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
@@ -443,27 +496,30 @@ def main():
     # first and applying it second with an explicit `-r` keeps the GIF to exactly one frame per
     # input, which is what was intended — 4 steps, not 260 near-identical ones.
     palette = os.path.join(workdir, "palette.png")
-    fps = 1 / 2.6  # one step every 2.6s
+
+    # A manifest with one explicit duration per frame -- how long that frame is on screen.
+    manifest = os.path.join(workdir, "frames.txt")
+    with open(manifest, "w") as fh:
+        for path, (frame, _) in zip(rendered, frames):
+            seconds = min(MAX_SECONDS, max(MIN_SECONDS, len(frame.lines) / LINES_PER_SECOND))
+            fh.write(f"file '{os.path.abspath(path)}'\nduration {seconds:.2f}\n")
+        # The concat demuxer ignores the final duration unless the file is named again afterwards.
+        # A known quirk with a one-line workaround; it leaves a harmless 4cs frame at the end.
+        fh.write(f"file '{os.path.abspath(rendered[-1])}'\n")
+    print("  holds: " + ", ".join(
+        f"{min(MAX_SECONDS, max(MIN_SECONDS, len(f.lines) / LINES_PER_SECOND)):.1f}s"
+        for f, _ in frames))
 
     subprocess.run(
-        ["ffmpeg", "-y", "-r", str(fps)] +
-        sum([["-i", p] for p in rendered], []) +
-        ["-filter_complex",
-         f"concat=n={len(rendered)}:v=1:a=0,scale=iw:ih:flags=lanczos,palettegen=max_colors=160",
-         palette],
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", manifest,
+         "-vf", "scale=iw:ih:flags=lanczos,palettegen=max_colors=160", palette],
         capture_output=True, text=True, check=True,
     )
 
-    cmd = ["ffmpeg", "-y", "-r", str(fps)]
-    for p in rendered:
-        cmd += ["-i", p]
-    for _ in rendered:
-        cmd += ["-i", palette]
-    inputs = "".join(f"[{i}:v]" for i in range(len(rendered)))
-    cmd += ["-filter_complex",
-            f"{inputs}concat=n={len(rendered)}:v=1:a=0[seq];"
-            f"[seq][{len(rendered)}:v]paletteuse=dither=bayer",
-            "-loop", "0", out_path]
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", manifest,
+           "-i", palette,
+           "-filter_complex", "[0:v][1:v]paletteuse=dither=bayer",
+           "-loop", "0", out_path]
 
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:

@@ -8,11 +8,14 @@ control plane that lets a program or an agent drive a Windows VM as a typed tool
 capture screenshots, inject input, move files, snapshot and restore. Headless by default, every
 operation through a capability boundary and an append-only journal.
 
-![An agent pushing a payload into a Windows guest, running it, and pulling the artifact back out](docs/demo.gif)
+![An agent driving a Windows guest: running code, transferring a file, and opening then closing a window onto it](docs/demo.gif)
 
-*Left: the typed protocol. Right: the same guest, live, receiving the transfer and running the code.
-Both halves are real — the GIF is rendered from the actual commands by
-`scripts/make-demo-gif.py`, so it cannot drift from the code or show anything the tool did not do.*
+*Left: the typed protocol, as typed. Right: the same guest, live. Both halves are real — the GIF is
+rendered from the commands as they actually ran by `scripts/make-demo-gif.py`, so it cannot drift
+from the code or show anything the tool did not do.*
+
+*The last step is the one to watch: a window opens onto the running guest, closes, and the machine
+carries on answering. The viewer is an ordinary process — the guest never notices.*
 
 It is **not** a desktop-integration layer. That space is well served — WinBoat (22.8k stars),
 WinPodX, winapps, LinOffice all put individual Windows windows on a Linux desktop via FreeRDP and
