@@ -1005,3 +1005,27 @@ lists. The claim was checked in ten seconds and the overlay is in use.
 
 **Rule.** Any experiment that changes the disk device, its options, or its format runs on an overlay.
 The base disk is read-only in practice, whatever the file permissions say.
+
+### D-019 addendum — the overlay is now the live disk, not a temporary one
+
+**Date:** 2026-09-17
+
+The experiment overlay stopped being temporary the moment it turned out to be the only thing standing
+between a crash and the sole copy of the Windows install. `wvm.toml` now boots
+`disk-overlay.qcow2`, which chains to `disk.qcow2`, and the base is treated as immutable.
+
+    disk.qcow2          the base — every byte the guest has ever written, and the ONLY copy of this
+                        install. Never booted directly.
+    disk-overlay.qcow2  the writable layer. Guest writes, crash dumps and test artefacts land here.
+
+**The rule that makes this safe, and the reason to write it down:** booting the base directly while
+an overlay references it makes the overlay's view of the disk wrong, and qcow2 does not detect it —
+there is no error, just a guest that behaves inexplicably later. An overlay is a live dependency on
+its backing file, which is exactly why there is one config rather than a canonical one and an
+experimental one. `wvm-test.toml` was deleted the moment it became a second way to start the same
+machine; two configs pointing at overlapping disks is the ambiguity that produced the stale
+production binary in D-014, and it does not get to happen again.
+
+Measured: the base is still 76189 MiB after a full session of experiments against it — including
+five snapshot save/restore cycles and four forced TRIMs — because every write went to the overlay.
+That is the property worth having: **a bad experiment now costs one `rm`, not a Windows reinstall.**
