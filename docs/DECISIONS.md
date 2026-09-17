@@ -1127,3 +1127,41 @@ client. Arm C (viewer attached) exists behind `--with-viewer` for that.
 `--display gtk`, so the standard way to start this VM opens a GTK window that lives INSIDE the QEMU
 process and therefore cannot be closed without killing the VM. Only `--headless` avoids it. That
 reframes the feature: it is not "give the VM a window", it is "make the window closable".
+
+## D-022 — The display socket lives in the 0700 tree, because it has no password
+
+**Date:** 2026-09-17
+**Status:** decided for display; a pre-existing exposure recorded, not fixed
+
+The display socket is unauthenticated by construction (`-spice ...,disable-ticketing=on`). Ticket
+auth would need a secret handed to every viewer, and the socket already has a better gate available:
+whether another process can traverse its parent directory. So the placement IS the security model,
+and it was measured rather than assumed:
+
+    /home/andy/.local/state/wvm/w11   mode 775   <- where the QMP socket lives
+    /run/user/1000                    mode 700   <- the per-user runtime directory
+
+Hence `spice_socket()` returns `$XDG_RUNTIME_DIR/wvm/<vm>.spice.sock`, and `prepare()` creates that
+directory **0700 explicitly** rather than inheriting the umask. Two details that only showed up by
+looking:
+
+- `create_dir_all` alone gives 0777 & ~umask, which here is **775** — group-traversable. For a
+  socket with no other authentication, that permission is the authentication.
+- `DirBuilder::mode` applies only to directories it actually creates, so a pre-existing directory
+  would keep whatever it had. The mode is therefore **asserted with `set_permissions`** after
+  creation, not merely requested.
+
+**Also recorded, and NOT fixed here:** the QMP socket is mode **775 in a 775 directory**, so any
+process in group `andy` can open it — and QMP is total control of the VM (reset it, stop it, read
+its memory, type into it). That is a wider exposure than the display socket this decision spends its
+effort protecting, and it predates this work.
+
+It is not fixed in the same commit because the fix changes an existing interface (a socket's mode,
+and a directory something else may rely on being traversable), and folding it into a feature commit
+would make both harder to review. On this host the practical risk is low: the only other account is
+`libvirt-qemu`, which is not in group `andy`. Filed as work, with the honest note that the display
+socket is currently the better-protected of the two.
+
+**Not addressed either:** a display socket outliving a crashed QEMU. QEMU unlinks on a clean exit but
+not on a crash, and a stale socket and a live one look identical from the filesystem. `display::show`
+therefore CONNECTS to the socket rather than stat-ing it (D-005).
