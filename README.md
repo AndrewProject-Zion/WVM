@@ -23,6 +23,14 @@ guest over a typed protocol, headless, with an auditable capability boundary.**
 `transfer push`, `transfer pull`, and snapshots (save, restore, list, delete). Nothing in the
 protocol is a stub.
 
+> **Snapshots carry a known risk.** On this Windows 11 build, roughly one `snapshot save` in five
+> bugchecks the guest with `0x50 PAGE_FAULT_IN_NONPAGED_AREA`. The fault is inside Windows' own
+> kernel — a fixed code offset relative to `PsLoadedModuleList` across four crashes with different
+> KASLR bases — and a bare vCPU pause of the same duration does **not** reproduce it, so it is the
+> snapshot's device-state write rather than the freeze. It is reproduced, localised and not yet
+> fixed. **Do not put anything in a snapshot you cannot afford to lose.** See D-017 and D-018 in
+> [`docs/DECISIONS.md`](docs/DECISIONS.md) for the measurements.
+
 ## If you are an agent, start here
 
 **→ [`WVM.md`](WVM.md)** is the protocol contract: every verb, the exact responses, and the traps
@@ -102,7 +110,7 @@ and hash-verified** — which is the difference between a sandbox and a roach mo
 | Capture | PNG of the live desktop, geometry assertion |
 | Input | absolute pointer moves and clicks, UK-correct keys and text |
 | Transfer | push and pull, chunked in lockstep, confined to a guest staging root |
-| Snapshots | save and restore **live**, RAM included — the guest rolls back, still running |
+| Snapshots | save and restore **live**, RAM included — the guest rolls back, still running. See the risk note above |
 
 ## What the guest refuses, and why that is the answer
 

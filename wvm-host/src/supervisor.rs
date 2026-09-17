@@ -92,9 +92,26 @@ impl Qmp {
 
     /// Run one command and return its result.
     pub fn execute(&mut self, command: &str, arguments: Option<Value>) -> Result<Value> {
-        // A command reply is read with the connection's default timeout, whatever a previous job
-        // loop may have set. Without this, a long job timeout would make a hung daemon hang the CLI.
-        let _ = self.stream.set_read_timeout(Some(DEFAULT_QMP_TIMEOUT));
+        self.execute_with_timeout(command, arguments, DEFAULT_QMP_TIMEOUT)
+    }
+
+    /// As `execute`, but with an explicit timeout for the COMMAND REPLY.
+    ///
+    /// A snapshot command does not merely start a job: while machine state is written, QEMU's main
+    /// loop is blocked and the reply itself can take minutes. With the 10-second default the caller
+    /// saw "Resource temporarily unavailable" and reported a FAILURE for a restore that had in fact
+    /// succeeded — the marker file was gone and the guest was running normally. Only measuring the
+    /// operation rather than the message exposed that.
+    ///
+    /// The timeout is set here and deliberately not left in place for anyone else: a quick command
+    /// must not inherit a job's patience, and the next caller sets its own.
+    pub fn execute_with_timeout(
+        &mut self,
+        command: &str,
+        arguments: Option<Value>,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
+        let _ = self.stream.set_read_timeout(Some(timeout));
 
         let mut payload = json!({ "execute": command });
         if let Some(args) = arguments {

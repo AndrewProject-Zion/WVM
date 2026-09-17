@@ -103,8 +103,9 @@ Snapshot the machine, restore it, list snapshots, delete one.
 
 Traps:
 
+- A SAVE CAN CRASH THE GUEST on this Windows 11 build — roughly one save in five ends in a 0x50 PAGE_FAULT_IN_NONPAGED_AREA bugcheck. The faulting instruction is in Windows' own kernel, at one fixed code offset across four crashes, and pausing the vCPUs for the same length of time does NOT reproduce it, so the trigger is the device-state write rather than the freeze. Reproduced, localised, NOT fixed. Do not snapshot anything you cannot afford to lose, and do not put a snapshot in the path of an unattended agent run.
 - The guest REFUSES this verb, permanently. Snapshots are a hypervisor capability and the guest has no view of its own hypervisor. The refusal names the command that works — it is not a stub awaiting an upgrade.
-- A save FREEZES the guest CPUs for a few seconds while state is written (measured ~6.5s on a 3.4 GiB machine) and no QMP message arrives during that window. Any client read timeout shorter than the pause fails intermittently, which makes it look like a flaky command rather than a fixed cost.
+- A save FREEZES the guest CPUs while the machine state is written, and NO QMP message arrives for the whole of that write. Measured here at 57 seconds with nine snapshots on the disk, 6.5 seconds when it was fresh — the pause GROWS as snapshots accumulate. A client read timeout shorter than the pause reports failure for work that is still succeeding, and makes a frozen guest look like a dead one.
 - A snapshot holds the machine's MEMORY as well as its disk, so it is roughly the RAM size rather than a delta. That is what makes a restore a rollback instead of a disk revert — and why snapshots are worth deleting.
 - Restoring while the guest is running is supported and it survives. It is still a rollback: anything written since the snapshot is gone, including files the agent created.
 

@@ -762,3 +762,170 @@ lifecycle verb that cannot restore a running VM is not the thing the verb exists
 change to a working boot path, and that decision is Dave's rather than something to slip in.
 
 ---
+
+## D-017 — A snapshot freezes the vCPUs, and that freeze is not a crash
+
+**Date:** 2026-09-17
+**Status:** resolved — the mechanism is a freeze, the fault was in the client's timeouts
+
+**What it looked like.** A `wvm vm snapshot save` timed out. The next `exec` timed out. `hello`
+timed out. The QMP socket itself timed out. The guest stayed silent for minutes while QEMU was alive
+with an 8.5 GB RSS. Two Windows bugchecks and two minidumps sat on the disk from the previous day.
+
+The obvious reading — and the one written into the source comments and reported — was that the
+snapshot path was corrupting machine state. **That reading was wrong**, and it was wrong in a way
+that would have sent the next person hunting for a corruption bug that does not exist.
+
+**What it actually is.** A save stops the vCPUs while the machine state is written, and no QMP
+message arrives for the whole of that write. Measured by watching the process rather than the
+client:
+
+```
+   elapsed    qemu write rate   guest
+       19s        28.3 MB/s     silent
+       41s        27.8 MB/s     silent
+       57s       746.5 MB/s     ANSWERED     <- rate jumps the instant the write ends
+```
+
+The guest was unresponsive for **57 seconds and then recovered on its own, unharmed**. The 746 MB/s
+figure is the same disk once it stops doing qcow2 copy-on-write, which is the whole explanation for
+the 28 MB/s: internal snapshots force COW on every cluster the new vmstate touches.
+
+**Corroboration.** After deleting thirteen accumulated test snapshots, the same rollback probe that
+had been failing passed end-to-end. The freeze grows with the number of snapshots the disk carries —
+6.5 seconds when the disk was fresh, 57 seconds with nine present. So snapshots degrade each other,
+and a disk nobody prunes becomes progressively slower to snapshot.
+
+**Eliminated, by measurement rather than argument:**
+
+- *Memory pressure.* `MemAvailable` 12.2 GB, `Dirty` 13 MB, `Writeback` 4 kB, memory PSI 0.00.
+- *`detect-zeroes=unmap`.* Not set — the qcow2 node carries `discard=unmap` only.
+- *An I/O hang.* I/O pressure was low and QEMU's write counter advanced continuously. A hung disk
+  would have shown a static counter, which is exactly how it was distinguished from slowness.
+- *QEMU having died.* It was alive throughout; only its main loop was blocked.
+
+**The four client faults this hid.** All mine, all in this repository:
+
+1. `JOB_READ_TIMEOUT` was 60 s. The pause between events during a write is the freeze, so a
+   timeout shorter than the freeze abandons a job that is still succeeding. Now 300 s.
+2. `execute()` read the snapshot COMMAND REPLY with the 10 s default. `snapshot-save` and
+   `snapshot-load` block the main loop while state is written, so the reply itself is delayed by the
+   whole freeze. That is why a restore reported failure while the marker file was already gone and
+   the guest was running — a false negative on a working operation. Now
+   `execute_with_timeout(.., SNAPSHOT_CMD_TIMEOUT)`.
+3. The verification probe slept five seconds after a restore before checking. It now waits for the
+   guest to answer, which is both correct and self-documenting: a guest that never returns inside a
+   measured bound is a real failure.
+4. The CLI said a save "can take a few seconds". It said that about an operation that writes the
+   machine's RAM.
+
+**The rule this is an instance of.** Every one of the four was a check whose failure mode was
+identical to its success mode: a timeout that fires whether the work is slow or broken, a sleep that
+expires whether the guest is recovering or dead. The measurement that broke it open was asking the
+process how much it had written, because that number distinguishes "busy" from "stuck" — and the
+first wrong hypothesis (corruption) had already been written into a comment before anyone asked.
+
+**Reversal cost.** None: this is a timeout and a message. The mechanism it describes is QEMU's, and
+the only way to avoid the freeze is a disk-only snapshot, which is a different feature with a
+different cost (D-016).
+
+**Recommendation recorded, not built:** `save` could warn when the disk carries many snapshots, or
+when the vmstate is large enough that the freeze will be long. The information is available — `list`
+is already called to verify the save — and the warning would be more honest than a progress message
+that has to guess.
+
+## D-018 — A snapshot save can crash the guest, and the fault is in Windows itself
+
+**Date:** 2026-09-17
+**Status:** open — reproduced and localised, not yet explained or fixed
+
+**What happens.** `wvm vm snapshot save` sometimes bugchecks the guest. Four dumps, all identical:
+
+```
+0x50 (0xfffffffffffffff8, 0x44, 0xfffff80452854277, 0xe)   2026-09-16
+0x50 (0xfffffffffffffff8, 0x44, 0xfffff80158a54277, 0xe)   2026-09-17
+0x50 (0xfffffffffffffff8, 0x44, 0xfffff8072cc54277, 0xe)   2026-09-17
+0x50 (0xfffffffffffffff8, 0x44, 0xfffff80446854277, 0xe)   2026-09-17
+```
+
+`0x50` is `PAGE_FAULT_IN_NONPAGED_AREA`. `Arg1 = 0xfffffffffffffff8` is a read at **offset -8 from a
+null pointer** — the signature of code walking a structure it should not have. Identical parameters
+across four boots means a **deterministic fault at a fixed code offset**, not a race.
+
+**Roughly one save in five**, from a count of the saves and crashes in this session. That is frequent
+enough to matter and too frequent to dismiss as a one-off.
+
+=== WHAT IT IS NOT — each eliminated by measurement ===
+
+| Hypothesis | How it was killed |
+|---|---|
+| The long vCPU freeze | `stop`, hold 60 s, `cont` — guest **survived**, no new dump |
+| The vmstate being large | a 2.96 GiB save crashed; a 2.90 GiB save did not |
+| Host memory pressure | `MemAvailable` 12.2 GB, `Dirty` 13 MB, memory PSI 0.00 |
+| An I/O hang | QEMU's write counter advanced continuously at 28 MB/s |
+| QEMU having died | alive throughout; only its main loop was blocked |
+| `detect-zeroes=unmap` | not set — the qcow2 node carries `discard=unmap` only |
+| An out-of-date storage driver | `viostor.sys` is `100.103.104.30200`, July 2026 |
+
+**The freeze and the crash are two different things, and conflating them cost this investigation real
+time.** D-017 records the freeze: a save stops the vCPUs while state is written, no QMP message
+arrives for the duration, and the guest recovers on its own — measured at 57 seconds with nine
+snapshots on the disk, 6.5 seconds when fresh. That is normal. The crash is separate, and it was
+found by looking at the screen instead of waiting on a timeout.
+
+=== WHAT IT IS — localised to the Windows kernel ===
+
+The triage dumps carry the crash header and a module-name table. Reading the header directly (offsets
+validated because `BugCheckCode` and all four parameters match the event log exactly) gives:
+
+```
+fault address  -  PsLoadedModuleList
+0xfffff80452854277  -  0xfffff804530135a0  =  0x7bf329
+0xfffff80158a54277  -  0xfffff801592135a0  =  0x7bf329
+0xfffff8072cc54277  -  0xfffff8072d4135a0  =  0x7bf329
+0xfffff80446854277  -  0xfffff804470135a0  =  0x7bf329
+```
+
+A **constant** displacement from a kernel global, across four boots with four different KASLR bases.
+Two addresses that keep a fixed distance while their absolute positions are independently randomised
+belong to the **same image** — and `PsLoadedModuleList` lives in `ntoskrnl.exe`. Independent
+support: the loaded drivers sit in `0xfffff807_31xxxxxx`–`0xfffff807_36xxxxxx`, while the fault is
+at `0xfffff807_2cc54277`, in the kernel image region below them.
+
+**So the faulting instruction is inside Windows' own kernel, not in a driver and not in WVM.**
+
+This is an inference from address relationships, not from reading a module record — the triage dump
+stores module *names* but not the records carrying their base addresses, and a pattern search for
+`KLDR_DATA_TABLE_ENTRY` returned only false positives. It should be stated as strongly supported
+rather than proven. A full kernel dump (`CrashDumpEnabled=2`) would settle it, and its physical
+memory can be read offline through `qemu-nbd` without a slow transfer over the control channel.
+
+**What that means practically: this is not a bug in this repository.** The trigger is the snapshot's
+device-state write, the effect is a Windows kernel fault, and no change to `wvm-state` or the
+protocol can fix it. The realistic fixes are hypervisor-side workarounds.
+
+=== THE VM HAS NO BACKUP ===
+
+`~/wvm/w11/disk.qcow2` is 76 GB and is the only copy of the Windows install. Nothing matching
+`wvm`/`w11` exists in `/mnt/Zion_Vault`. Any experiment that changes the disk device model — swapping
+`virtio-blk-pci` for AHCI to test whether the device is implicated, for instance — risks the guest
+becoming unbootable, and the cost of that is a full Windows reinstall.
+
+**Take a copy before any such experiment.** Testing on a disposable second disk would be better.
+
+=== NEXT EXPERIMENTS, in increasing cost ===
+
+1. **Remove `discard=unmap`** from the qcow2 node. It is the one non-default option added during the
+   `-blockdev` conversion (D-016), it sits in the disk path, and it is a one-line change.
+2. **Pin `aio=threads`** instead of the default. QEMU's block backend was observed waiting in
+   `io_cqring_wait`, so io_uring is in play during the save.
+3. **Attribute the fault properly** with a full kernel dump read offline via `qemu-nbd`.
+4. **Change the disk device model** — the decisive test for the device-state path, and the one that
+   needs a backup first.
+
+**A caution on measurement.** The failure rate is low enough that a handful of clean saves proves
+nothing; two saves in a row have already succeeded while others crashed. Any of the above needs of
+the order of ten to fifteen saves per arm, and a stated decision rule beforehand, or it will produce
+exactly the kind of confident wrong answer this project keeps having to dig out of its comments.
+
+**Reversal cost.** None for the diagnosis. The workarounds above are one-line config changes.

@@ -60,7 +60,7 @@ def call(port, req, timeout=120):
         s.close()
 
 
-def run_on_guest(port, arg, timeout=40):
+def run_on_guest(port, arg, timeout=180):
     r = call(port, {"op": "exec", "program": "cmd.exe", "args": ["/c", arg],
                     "cwd": None, "require_allowlist": False, "timeout_ms": timeout * 1000},
              timeout=timeout + 20)
@@ -77,6 +77,29 @@ def marker_exists(port):
     p = run_on_guest(port, f"dir /b {MARKER}")
     out = (p.get("stdout") or "").strip()
     return "rollback-marker.txt" in out, out
+
+
+def wait_for_guest(port, deadline_s=240):
+    """Wait until the guest answers, or give up. Returns True if it came back.
+
+    A RESTORE FREEZES THE vCPUs while machine state is written, and no QMP message arrives for the
+    whole of that write — measured at 57 seconds on a disk carrying nine snapshots. A fixed
+    five-second sleep therefore turned a working restore into a reported failure, twice, and sent
+    the investigation looking for corruption that was not there.
+
+    Waiting for the answer is both correct and self-documenting: if the guest never returns, that is
+    a real failure, because the freeze has been measured at under a minute.
+    """
+    end = time.time() + deadline_s
+    while time.time() < end:
+        try:
+            if call(port, {"op": "hello", "protocol_version": 1, "client": "rollback"},
+                    timeout=10) is not None:
+                return True
+        except Exception:
+            pass
+        time.sleep(3)
+    return False
 
 
 def wvm(*args):
@@ -120,6 +143,14 @@ def main():
     print(f"    {out.strip().splitlines()[-1]}")
 
     # --- 3. do something that changes the disk ---
+    #
+    # WAIT for the guest before acting on it. A save freezes the vCPUs while machine state is
+    # written, and after a large one the guest can stay starved for longer still: a verification
+    # round timed out writing this marker (180s) and then the guest answered normally moments later.
+    # Waiting is correct; treating that pause as a failure is what made a working save look broken.
+    if not wait_for_guest(args.port):
+        failures.append("the guest did not answer after the save, before the marker was written")
+        print("  FAIL: the guest never answered after the save")
     print("  writing a marker file inside the guest")
     p = run_on_guest(args.port, f"echo rollback-test-marker > {MARKER}")
     if p.get("code") != 0:
@@ -145,9 +176,17 @@ def main():
 
     # --- 6. the guest should be back, and the write should be gone ---
     #
-    # A moment first: after a load the guest resumes, and the service needs a chance to answer.
-    time.sleep(5)
-    time.sleep(0)  # (kept explicit: no hidden retry loop; the following call reports plainly)
+    # WAIT for it rather than sleeping a token amount. See `wait_for_guest`: the restore freezes
+    # the vCPUs for as long as the machine state takes to write, which has been measured at nearly
+    # a minute. A five-second sleep here reported a working restore as a failure.
+    if not wait_for_guest(args.port):
+        failures.append(
+            "the guest did not answer within 240s of the restore. The freeze while state is "
+            "written has been measured at under a minute, so this is a real failure, not slowness."
+        )
+        print("  FAIL: the guest never came back after the restore")
+    else:
+        print("  guest answering again (the freeze while state is written is expected)")
 
     present, out = marker_exists(args.port)
     if present:

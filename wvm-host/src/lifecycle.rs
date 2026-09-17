@@ -54,12 +54,26 @@ pub const DISK_NODE: &str = "disk0";
 /// reports a timeout.
 const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// The timeout for the snapshot COMMANDS themselves, which is not the same thing as the job.
+///
+/// `snapshot-save` and `snapshot-load` block QEMU's main loop while state is written, so even the
+/// command's reply is delayed by the whole freeze. Sending these with the connection default made a
+/// successful restore report a failure; measured at several minutes on a disk carrying many
+/// snapshots.
+const SNAPSHOT_CMD_TIMEOUT: std::time::Duration = SNAPSHOT_TIMEOUT;
+
 /// How long a single read may wait for the next job event.
 ///
-/// Snapshots of a running guest take seconds, and there can be a pause between status transitions
-/// while QEMU flushes. This is per-read, not for the whole job: the overall bound is
+/// MEASURED, not guessed: a save FREEZES the vCPUs while machine state is written, and no QMP
+/// message arrives for the whole of that write. With nine internal snapshots on the disk the write
+/// ran at ~28 MB/s (the same disk does 746 MB/s once it stops doing qcow2 copy-on-write) and the
+/// freeze was 57 SECONDS. On a fresh disk it was 6.5 seconds.
+///
+/// So the pause is not a fixed cost — it grows with the snapshot state the disk is carrying.
+/// 60 seconds was tried and was too short, which made a successful save report as a failure and
+/// made the frozen guest look like a dead one. This is per-read; the overall bound is
 /// `SNAPSHOT_TIMEOUT`.
-const JOB_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const JOB_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A counter for job ids, so repeated snapshots under one tag do not collide.
 ///
@@ -165,7 +179,7 @@ pub fn save(qmp: &mut Qmp, tag: &str) -> Result<Snapshot> {
     // The process id and a monotonic counter are enough: jobs live for one host invocation, so
     // there is nothing to collide with across processes.
     let job_id = format!("wvm-save-{tag}-{}", next_job_seq());
-    qmp.execute(
+    qmp.execute_with_timeout(
         "snapshot-save",
         Some(serde_json::json!({
             "job-id": job_id,
@@ -176,6 +190,7 @@ pub fn save(qmp: &mut Qmp, tag: &str) -> Result<Snapshot> {
             "devices": [DISK_NODE],
             "tag": tag,
         })),
+        SNAPSHOT_CMD_TIMEOUT,
     )
     .context("starting snapshot-save")?;
 
@@ -199,7 +214,7 @@ pub fn restore(qmp: &mut Qmp, tag: &str) -> Result<()> {
 
     // Unique for the same reason as `save` — see the note there.
     let job_id = format!("wvm-load-{tag}-{}", next_job_seq());
-    qmp.execute(
+    qmp.execute_with_timeout(
         "snapshot-load",
         Some(serde_json::json!({
             "job-id": job_id,
@@ -207,6 +222,7 @@ pub fn restore(qmp: &mut Qmp, tag: &str) -> Result<()> {
             "devices": [DISK_NODE],
             "tag": tag,
         })),
+        SNAPSHOT_CMD_TIMEOUT,
     )
     .context("starting snapshot-load")?;
 

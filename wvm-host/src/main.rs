@@ -656,11 +656,23 @@ fn run_vm(action: VmAction) -> Result<()> {
                     let tag = tag
                         .as_deref()
                         .context("a snapshot needs a name: `wvm vm snapshot save <tag>`")?;
-                    println!("saving the machine state as '{tag}' — this can take a few seconds");
+                    println!(
+                        "saving the machine state as '{tag}' — the guest FREEZES while this \
+writes, and it can take a minute or more on a disk carrying snapshots. That freeze is expected; \
+a timeout here does not mean the save failed."
+                    );
                     let s = lifecycle::save(&mut qmp, tag)?;
                     println!(
                         "  saved '{tag}' — {} of machine state (RAM and devices)",
                         human_size(s.vm_size_bytes)
+                    );
+                    // Say this rather than let it be discovered as a mystery timeout. The save
+                    // freezes the vCPUs while it writes, and the guest can stay unresponsive for a
+                    // while afterwards — long enough that a caller whose next command times out
+                    // would reasonably conclude the snapshot broke the machine.
+                    println!(
+                        "  the guest may stay unresponsive for a moment while it catches up; \
+that is the freeze ending, not a failure"
                     );
                 }
                 "restore" => {
