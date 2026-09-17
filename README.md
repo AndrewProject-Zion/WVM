@@ -1,12 +1,12 @@
 # WVM — a headless execution sandbox for AI agents
 
-Drive Windows 11 from a Linux terminal over a typed, hostile-peer-guarded JSON protocol.
+**Give your agent a Windows guest instead of your host machine — and keep the desktop for
+yourself.**
 
-A Rust control plane that lets a program or an agent drive a Windows VM as a typed tool: launch
-processes, capture screenshots, inject input, move files, snapshot and restore. Headless by
-default, every operation through a capability boundary and an append-only journal.
-
-Give your agent a Windows guest instead of your host machine.
+Drive Windows 11 from a Linux terminal over a typed, hostile-peer-guarded JSON protocol. A Rust
+control plane that lets a program or an agent drive a Windows VM as a typed tool: launch processes,
+capture screenshots, inject input, move files, snapshot and restore. Headless by default, every
+operation through a capability boundary and an append-only journal.
 
 ![An agent pushing a payload into a Windows guest, running it, and pulling the artifact back out](docs/demo.gif)
 
@@ -34,6 +34,46 @@ around a protocol on a socket, so the desktop is genuinely optional: it can arri
 moment without the agent seeing anything change. **The window is a view, not the interface.**
 Closing it does not stop the VM, because the viewer is a separate process — see the `display` traps
 in [`WVM.md`](WVM.md).
+
+| | **WVM** | WinBoat · WinPodX · winapps · LinOffice |
+|---|---|---|
+| Built for | an agent or a program driving the guest | a person using Windows apps |
+| Interface | a typed protocol over a socket | per-app windows, via FreeRDP + RemoteApp |
+| Default state | **headless** — nothing displayed unless asked | the desktop *is* the product |
+| The desktop | opt-in, and removable at any time | assumed — the architecture rests on it |
+| Capability boundary | explicit grants; every denial journalled | not applicable |
+| Guest-side footprint | one ~600 KB service, core DLLs only | a guest server plus RemoteApp plumbing |
+
+That is not a claim that they are worse — they are mature and they solve their problem well. It is
+a claim about which one to reach for: if you want Windows *applications* on your Linux desktop, use
+theirs. If you want to hand an agent a Windows machine and stay able to look at it, this is the one
+built for that.
+
+## What that looks like in practice
+
+**Hand an agent somewhere to work that is not your machine.** It runs the code, installs the
+dependency, breaks the thing — inside a guest you snapshotted first, with a picture of what it did
+and the file it produced, and a rollback if it went wrong.
+
+```sh
+wvm vm snapshot save before --config ~/wvm/wvm.toml   # memory included, machine still running
+wvm vm exec --config ~/wvm/wvm.toml "your-risky-thing"
+
+wvm vm capture --config ~/wvm/wvm.toml --out /tmp/after.png    # what the screen looks like now
+wvm vm transfer pull --config ~/wvm/wvm.toml \
+    'C:\ProgramData\wvm\staging\result.json' ./result.json  # and what it produced
+
+wvm vm display show --config ~/wvm/wvm.toml           # look at it yourself, if you want
+wvm vm snapshot restore before --config ~/wvm/wvm.toml # or put the whole machine back
+```
+
+The restore is the interesting one: it returns the guest **running, with its windows open**, to the
+state it was in. Not an earlier disk image — an earlier machine. That is the difference between
+undoing something and reinstalling it.
+
+And every step of that went through a capability boundary that can be narrowed per run, with the
+requests *and the denials* written to an append-only journal, so "what did the agent actually do"
+has an answer that is not the agent's own summary of itself.
 
 **Status: every verb implemented and verified against a live guest** — `exec`, `capture`, `input`,
 `transfer push`, `transfer pull`, `display`, and snapshots (save, restore, list, delete). Nothing in
@@ -139,6 +179,8 @@ and hash-verified** — which is the difference between a sandbox and a roach mo
 | Input | absolute pointer moves and clicks, UK-correct keys and text |
 | Transfer | push and pull, chunked in lockstep, confined to a guest staging root |
 | Snapshots | save and restore **live**, RAM included — the guest rolls back, still running. See the risk note above |
+| Display | `show` / `hide` / `status` — a window on request, closable without touching the VM. Unix socket, no TCP port |
+| Audio | a sound card Windows drives with its own in-box UAA driver, routed to the viewer. Confirmed by ear |
 
 ## What the guest refuses, and why that is the answer
 
@@ -161,7 +203,7 @@ than by a connection timing out.
 ./scripts/verify-all.sh --list       # what runs, and why
 ```
 
-Twelve probes, and a result with three states rather than two: **passed**, **failed**, and **could
+Thirteen probes, and a result with three states rather than two: **passed**, **failed**, and **could
 not run**. That last one is not a pass. A probe that never executed has verified nothing, and
 conflating the two is how a build ships on the strength of a check that did not happen.
 
@@ -311,6 +353,10 @@ wvm vm input    text  --config ~/wvm/wvm.toml 'hello from the host'
 wvm vm transfer push --config ~/wvm/wvm.toml ./payload.bin 'C:\ProgramData\wvm\staging\payload.bin'
 wvm vm transfer pull --config ~/wvm/wvm.toml 'C:\ProgramData\wvm\staging\result.bin' ./result.bin
 
+# look at what it is doing, then stop looking
+wvm vm display show --config ~/wvm/wvm.toml
+wvm vm display hide --config ~/wvm/wvm.toml
+
 # snapshot before letting something risky run, and roll back after
 wvm vm snapshot save before-install --config ~/wvm/wvm.toml
 wvm vm snapshot list               --config ~/wvm/wvm.toml
@@ -383,10 +429,32 @@ Lower memory footprint, faster boot, and nothing in the loop that a human is exp
 this for agent execution. Capture still works here — it reads the framebuffer QEMU is rendering even
 when no window is shown.
 
-### Windowed (visual telemetry)
+### A window, on request
 
-Attach a display when you want to watch what the agent is doing — absolute pointer positioning, a UI
-that did not respond as expected, a guest mid-boot.
+The one to reach for. The display server is always there and costs nothing when nobody is watching
+(measured: **0 CPU ticks over 30 seconds**), so the desktop is not something you decide about at
+boot — it is something you open and close.
+
+```sh
+wvm vm display show    --config ~/wvm/wvm.toml   # a window onto the running guest
+wvm vm display status  --config ~/wvm/wvm.toml   # is it up, and is anyone attached
+wvm vm display hide    --config ~/wvm/wvm.toml   # gone again
+```
+
+**Closing it does not stop the VM.** The viewer is an ordinary process attached to a socket, so
+`hide` leaves QEMU untouched and the agent keeps working through the same machine — the guest does
+not notice. That is the difference from the GTK window below, which lives *inside* the QEMU process
+and can only be closed by killing the machine.
+
+`show` refuses if a viewer is already attached: a second simultaneous SPICE attachment is the
+unreliable path, and it presents as *"connected to server"* with a window that never paints. Close
+the first one first. The socket is a unix socket with **no authentication**, so its location is its
+access control — see the `display` traps in [`WVM.md`](WVM.md).
+
+### Windowed, the fixed way (GTK or VNC)
+
+Sometimes you want the display attached from boot — an install you need to watch, or a machine you
+are debugging by hand. Both of these bake the display into the QEMU process:
 
 ```sh
 ./scripts/start-windows.sh                    # GTK window on the host
@@ -394,9 +462,9 @@ python3 scripts/vm-with-display.py --display vnc ~/wvm/wvm.toml
 ```
 
 For VNC, point Remmina (or any viewer) at `127.0.0.1:5900` — bound to loopback, no password, so do
-not forward that port. `--display sdl` also works if GTK misbehaves under your compositor.
-
-`--vnc-port N` moves it if 5900 is taken.
+not forward that port. `--display sdl` also works if GTK misbehaves under your compositor, and
+`--vnc-port N` moves it if 5900 is taken. The trade: a window you cannot close without stopping the
+guest, and audio that goes to this machine's speakers rather than to a viewer.
 
 ### Working in the guest by hand
 
