@@ -35,7 +35,9 @@ guest, which is the point of cross-compiling with the GNU toolchain.
 - [x] Capability grant type with verbs as a closed enum
 - [x] Round-trip tests including malformed and oversized frames
 
-**Verification:** 18 tests in `wvm-ipc`, covering empty payloads, sequential frames staying
+**Verification:** the full `wvm-ipc` suite (the count lives in the crate, not here -- a number
+written into a plan goes stale the next time someone adds a test, which is exactly what happened to
+the "18" this line used to claim). It covers empty payloads, sequential frames staying
 aligned, clean-EOF-vs-truncation, an oversized header refused *before* allocation, and a
 `deny_all` grant refusing every verb.
 

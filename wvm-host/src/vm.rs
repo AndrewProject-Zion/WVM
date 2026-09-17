@@ -486,6 +486,39 @@ impl VmConfig {
             self.spice_socket().display()
         ));
 
+        // AUDIO, and these four arguments must stay ADJACENT to the -spice pair above. Both of the
+        // ways of separating them were measured on this host, and each is a VM that refuses to
+        // BOOT -- not merely silent audio:
+        //
+        //   hda device with no -audiodev -> "no default audio driver available"
+        //   -audiodev spice with no -spice -> "Cannot use spice audio without -spice"
+        //
+        // So if the display server is ever made optional, this block moves inside the SAME
+        // conditional. Split them and the SPICE-off configuration stops starting.
+        //
+        // The backend is `spice` and not `pipewire`/`pa`, which were measured to open a real sink
+        // on the HOST ("snd0" appeared in pactl). Either of those would play the guest's audio out
+        // of this machine's own speakers instead of into the viewer, which is not the feature.
+        //
+        // The device is Intel HDA because Windows 11 drives it from its own in-box UAA driver --
+        // hdaudio.sys, hdaudbus.sys and hdaudio.inf are present in the guest and HdAudAddService is
+        // registered -- so nothing has to be installed inside Windows. This is the same rule that
+        // made the NIC `e1000e` instead of `virtio-net`: choose the device the guest can already
+        // drive, or a missing driver leaves it with no hardware at all. AC97 is the counter-example,
+        // with no Windows 10/11 driver.
+        //
+        // `hda-output` rather than `hda-duplex`, deliberately. Duplex adds a capture path, and this
+        // guest is driven by an agent that does not need a microphone -- while the host it runs on
+        // has a real one. An output-only codec means the guest has no route to record the room it
+        // is sitting in. If capture is ever wanted, `hda-duplex` is the drop-in and this comment is
+        // the reason it was not the default.
+        a.push("-audiodev".into());
+        a.push("spice,id=snd0".into());
+        a.push("-device".into());
+        a.push("ich9-intel-hda".into());
+        a.push("-device".into());
+        a.push("hda-output,audiodev=snd0".into());
+
         // Serial console to a file: the boot log exists whether or not anyone is watching.
         a.push("-serial".into());
         a.push(format!("file:{}", self.serial_log().display()));
@@ -728,6 +761,32 @@ mod tests {
             joined.contains("-display none"),
             "must not require a display"
         );
+    }
+
+    #[test]
+    fn the_audio_arguments_stay_coupled_to_the_display_server() {
+        // Every way of getting this wrong is a VM that does not START, not merely one with no
+        // sound. Both were measured on this host rather than reasoned about:
+        //   hda device with no -audiodev    -> "no default audio driver available"
+        //   -audiodev spice with no -spice  -> "Cannot use spice audio without -spice"
+        // The first assertion is therefore about the COUPLING, not the args: the audio block is
+        // only safe because the display server above it is unconditional. Make one conditional and
+        // this fails, which is the point.
+        let joined = config().qemu_args().join(" ");
+        assert!(joined.contains("-audiodev spice"), "no audio backend: {joined}");
+        assert!(joined.contains("ich9-intel-hda"), "no audio controller: {joined}");
+        assert!(joined.contains("hda-output"), "no codec: {joined}");
+        assert_eq!(
+            joined.contains("-spice"),
+            joined.contains("-audiodev"),
+            "audio and -spice must be gated together or the SPICE-off case cannot boot: {joined}"
+        );
+        // pipewire/pa were measured to open a sink on the HOST, so the guest's audio would come out
+        // of this machine's speakers instead of the viewer.
+        assert!(!joined.contains("-audiodev pipewire"), "audio would leave the viewer: {joined}");
+        assert!(!joined.contains("-audiodev pa,"), "audio would leave the viewer: {joined}");
+        // Output-only on purpose: duplex would give an agent-driven guest a route to the host's mic.
+        assert!(!joined.contains("hda-duplex"), "duplex adds a capture path: {joined}");
     }
 
     #[test]

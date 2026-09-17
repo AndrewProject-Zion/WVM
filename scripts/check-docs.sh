@@ -72,7 +72,12 @@ echo "=== docs referenced in the README exist ==="
 grep -oE 'docs/[A-Z0-9-]+\.md|[A-Z0-9-]+\.md' README.md | sort -u | while read -r d; do
     case "$d" in
         docs/*) path="$d" ;;
-        *)      path="docs/$d" ;;
+        # A bare filename may live at the repo ROOT (AGENTS.md does) or in docs/. Assuming docs/
+        # only reported AGENTS.md as MISSING while the link check further down called the very same
+        # reference "ok" -- a gate that contradicts itself gets ignored, which is worse than no gate.
+        *)
+            if [ -f "$d" ]; then path="$d"; else path="docs/$d"; fi
+            ;;
     esac
     if [ -f "$path" ]; then
         printf '  %-30s present\n' "$d"
