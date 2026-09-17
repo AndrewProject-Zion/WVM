@@ -8,6 +8,11 @@ control plane that lets a program or an agent drive a Windows VM as a typed tool
 capture screenshots, inject input, move files, snapshot and restore. Headless by default, every
 operation through a capability boundary and an append-only journal.
 
+Driving Windows from a Linux terminal is the mechanical description of something more
+interesting: **WSL inverts one direction, and this inverts it back.** Where WSL gives a
+Windows developer Linux primitives, WVM gives a Linux-native agent Win32 runtime state —
+no FreeRDP, no SSH, no desktop session. The comparison is further down this file.
+
 ![An agent driving a Windows guest: running code, transferring a file, and opening then closing a window onto it](docs/demo.gif)
 
 *Left: the typed protocol, as typed. Right: the same guest, live. Both halves are real — the GIF is
@@ -51,6 +56,44 @@ That is not a claim that they are worse — they are mature and they solve their
 a claim about which one to reach for: if you want Windows *applications* on your Linux desktop, use
 theirs. If you want to hand an agent a Windows machine and stay able to look at it, this is the one
 built for that.
+
+## Reverse WSL
+
+WSL inverts one direction: it gives a Windows developer Linux primitives. **This inverts it back** —
+a Linux-native agent reaching Win32 runtime state, with no FreeRDP, no SSH, and no desktop session.
+
+| | WSL2 | WVM |
+|---|---|---|
+| Direction | Windows host driving a Linux guest | Linux host driving a Windows guest |
+| Running a command | `wsl.exe <cmd>`, stdio piped | `wvm vm exec "<cmd>"`, JSON framed |
+| Seeing the desktop | WSLg — seamless windows, always composited | `wvm vm display show` — a socket you attach and detach at will |
+| Your filesystem | `/mnt/c` shared straight into the guest | **never exposed**; explicit lockstep chunked transfer |
+| Input | software-level OS integration | emulated hardware via QMP, no OS integration to subvert |
+| Rollback | `wsl --shutdown`, i.e. a cold boot | live RAM + device state snapshotted into the disk |
+| Servicing the guest binary | package manager inside the guest | offline `qemu-nbd`, hash-verified |
+
+Two rows are the ones that matter for an agent, and both are about what the guest **cannot** reach:
+
+**Your host is not in the guest's filesystem namespace.** There is no `/mnt/c` equivalent, because
+there is no shared-folder mechanism to abuse — nothing that a prompt-injected command inside the
+guest can walk out through. Moving a file requires an explicit `transfer push` or `transfer pull`,
+chunked and acknowledged. Note what this does *not* claim: the guest has its own working network
+(it boots with a slirp NIC and full internet). The isolation is the **absent filesystem path**, not
+a network airgap.
+
+**Input goes in at the emulated hardware layer, so there is no focus to steal.** Windows' own
+session-0 isolation blocks `SendInput` from a service — that is why this project does not use it
+(D-010). QMP scancodes and mouse events arrive as *devices*, underneath the window manager, so a
+guest that steals focus or holds an elevation prompt cannot lock the agent out of the keyboard.
+The honest limit: driving an elevated (UAC) prompt through emulated input is unreliable in practice,
+and when a step needs a human at a screen, use the human.
+
+**And rollback is real but not free — read this one carefully.** `snapshot-save` writes the guest's
+entire RAM into its own disk with roughly 28 MB/s of throughput while the vCPUs are frozen, so a
+save is tens of seconds, not sub-second; `snapshot-load` returns in about 3 seconds. A save can also
+bugcheck our guest, which is open as issue #1 with the full evidence attached. It is a genuinely
+useful primitive — WSL's answer is a cold boot — and it is not a safety net you should reach for
+mid-task without knowing that.
 
 ## What that looks like in practice
 
