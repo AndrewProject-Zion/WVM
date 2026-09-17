@@ -11,6 +11,7 @@
 //! already decided the request was permissible; a compromised guest gains no authority it was
 //! not already granted.
 
+mod capabilities;
 mod doctor;
 mod guestclient;
 mod image;
@@ -39,6 +40,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print what this build can do, as text or JSON.
+    ///
+    /// The same list `WVM.md` is generated from, so an agent can ask the binary rather than trust a
+    /// document that may have been written against a different version.
+    Capabilities {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Emit the markdown that WVM.md is generated from.
+        #[arg(long)]
+        markdown: bool,
+    },
+
     /// Check the host environment and report anything missing.
     ///
     /// Reproduces the checks recorded in docs/VERIFIED-ENVIRONMENT.md so that "works on my
@@ -295,6 +309,23 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Command::Capabilities { json, markdown } => {
+            if markdown {
+                // Straight to stdout with no trailing banner, so `> WVM.md` produces exactly the
+                // file `scripts/check-docs.sh` regenerates and compares.
+                print!("{}", capabilities::render_markdown());
+            } else if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&capabilities::CAPABILITIES)?
+                );
+            } else {
+                for c in capabilities::CAPABILITIES {
+                    println!("{:10} {:6}  {}", c.op, c.runs_on, c.summary);
+                }
+            }
+            Ok(())
+        }
         Command::Doctor { strict } => {
             let report = doctor::run();
             print!("{}", report.render());

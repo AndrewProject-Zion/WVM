@@ -21,3 +21,6 @@ __pycache__/
 *.bak
 *.bak.*
 *.orig
+
+# Working documents: plans are drafts, not promises. Only decisions go in docs/.
+.hermes/

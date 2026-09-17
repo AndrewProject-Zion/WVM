@@ -95,6 +95,39 @@ for entry in "target/release/wvm:wvm (host)" "target/x86_64-pc-windows-gnu/relea
 done
 
 echo
+echo "=== links in the README point at files that exist ==="
+# A README is the first thing a stranger reads and the easiest thing to leave pointing at a file
+# that moved. Every relative markdown link is resolved here.
+for target in $(grep -oE '\]\([A-Za-z0-9_./-]+\.md\)' README.md | tr -d '()' | sed 's/^\]//' | sort -u); do
+    if [ -f "$target" ]; then
+        printf '  %-24s ok\n' "$target"
+    else
+        printf '  %-24s MISSING — the README links to it\n' "$target"
+        fail=1
+    fi
+done
+
+echo
+echo "=== WVM.md matches the capabilities the binary reports ==="
+# WVM.md is GENERATED from wvm-host/src/capabilities.rs. The failure this catches is specific and
+# it has already happened once in this repo: a document that was true when written and quietly
+# stopped being true. Regenerate and compare, so a verb that changes without the doc changing
+# fails here rather than misleading whoever reads it next.
+BIN="target/release/wvm"
+if [ ! -x "$BIN" ]; then
+    printf '  %-24s NOT BUILT — cannot check (run cargo build --release first)\n' "WVM.md"
+    fail=1
+else
+    if "$BIN" capabilities --markdown | diff -q - WVM.md >/dev/null 2>&1; then
+        printf '  %-24s up to date (%s verbs)\n' "WVM.md" "$("$BIN" capabilities --json | grep -c '"op"')"
+    else
+        printf '  %-24s STALE — regenerate with: %s capabilities --markdown > WVM.md\n' "WVM.md" "$BIN"
+        "$BIN" capabilities --markdown | diff - WVM.md | head -20
+        fail=1
+    fi
+fi
+
+echo
 if [ "$fail" -eq 0 ]; then
     echo "no mismatches found in the checked claims"
 else

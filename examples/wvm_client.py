@@ -139,6 +139,9 @@ def explain(response: dict) -> str:
     if status == "error":
         message = response.get("message", "")
         if "denied" in message:
+            # A gate refusal is a deliberate boundary: the verb was not in the daemon's grant. This
+            # is different from a verb that is granted but has nothing to talk to, and a caller
+            # needs to tell them apart — one is policy, the other is state.
             return f"REFUSED by the capability gate - {message}"
         if "not implemented" in message:
             return f"understood, but this build cannot do it yet - {message}"
@@ -232,6 +235,10 @@ def cmd_boundary(binary: Path) -> int:
                 return 1
 
             print("Daemon started with the grant: inspect only")
+            print()
+            print("This exercises the CAPABILITY GATE, not a running VM. Refusals below come from")
+            print("the grant, so they hold whether or not a guest is present — which is why this")
+            print("is the one command worth running first.")
             print()
 
             with Client(sock_path) as c:

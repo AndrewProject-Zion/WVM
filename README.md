@@ -23,6 +23,22 @@ guest over a typed protocol, headless, with an auditable capability boundary.**
 `transfer push`, `transfer pull`, and snapshots (save, restore, list, delete). Nothing in the
 protocol is a stub.
 
+## If you are an agent, start here
+
+**→ [`WVM.md`](WVM.md)** is the protocol contract: every verb, the exact responses, and the traps
+that cost real time to find. It is generated from the code, so it cannot describe a verb that does
+not exist — `scripts/check-docs.sh` fails the build if it drifts.
+
+**→ [`AGENTS.md`](AGENTS.md)** is for an agent changing this codebase: the verification commands,
+and the house rules that were learned expensively.
+
+An agent can also ask the binary directly, rather than trust a document:
+
+```sh
+wvm capabilities          # what this build can do, as a table
+wvm capabilities --json   # the same, for a caller that would rather not parse prose
+```
+
 ## The one command to run first
 
 Before installing anything, watch the capability boundary work:
