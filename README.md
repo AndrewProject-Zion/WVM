@@ -31,9 +31,9 @@ The same guest is both things at once. Give it to an agent as a sandbox, and the
 there when a human wants it:
 
 ```
-wvm vm display show     # a window onto the running guest, for you
-wvm vm display hide     # gone again; the VM never notices
-wvm vm exec "..."       # and the agent carries on driving the same machine
+wvm vm display show --config ~/wvm/wvm.toml    # a window onto the running guest, for you
+wvm vm display hide --config ~/wvm/wvm.toml    # gone again; the VM never notices
+wvm vm exec "..."   --config ~/wvm/wvm.toml    # and the agent keeps driving the same machine
 ```
 
 **That combination is structural, not a feature.** WinBoat and WinPodX are built around *per-app
