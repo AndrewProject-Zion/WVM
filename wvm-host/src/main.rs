@@ -28,6 +28,8 @@ mod vm;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use wvm_ipc::{RequestKind, Verb, PROTOCOL_VERSION};
 
@@ -109,8 +111,8 @@ enum Command {
 enum VmAction {
     /// Check the definition is valid and report what would run.
     Validate {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
     },
 
     /// Print the QEMU command line without running it.
@@ -118,26 +120,26 @@ enum VmAction {
     /// A command line you can read before executing is worth more than one assembled invisibly
     /// at spawn time.
     Cmdline {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
     },
 
     /// Show whether the VM is running, and how that was determined.
     Status {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
     },
 
     /// Create the state directory and disk image; make no other changes.
     Prepare {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
     },
 
     /// Start the VM and wait until QEMU answers.
     Start {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
 
         /// How long to wait for QEMU to become responsive.
         #[arg(long, default_value_t = 60)]
@@ -146,14 +148,14 @@ enum VmAction {
 
     /// Suspend the guest, returning resources to the host.
     Suspend {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
     },
 
     /// Ask the guest to shut down, waiting for it to go.
     Shutdown {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
 
         #[arg(long, default_value_t = 120)]
         timeout: u64,
@@ -161,8 +163,8 @@ enum VmAction {
 
     /// Print the tail of the serial console — the first place to look when a VM will not boot.
     Log {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
 
         #[arg(long, default_value_t = 40)]
         lines: usize,
@@ -173,8 +175,8 @@ enum VmAction {
     /// Both paths must be inside the guest's staging roots. The guest checks that, not the host —
     /// which is the point of the staging design: the side that writes decides where writes may land.
     Transfer {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
 
         /// `push` (host to guest) or `pull` (guest to host).
         #[arg(value_parser = ["push", "pull"])]
@@ -207,8 +209,8 @@ enum VmAction {
     /// attaches or detaches a VIEWER -- a separate process, which means closing the window cannot
     /// take the VM down with it.
     Display {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
 
         /// `show`, `hide` or `status`.
         #[arg(value_parser = ["show", "hide", "status"])]
@@ -225,8 +227,8 @@ enum VmAction {
     /// Requires the VM to be running — QEMU holds the state, so this is a QMP operation against a
     /// live hypervisor.
     Snapshot {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
 
         /// `save`, `restore`, `list` or `delete`.
         #[arg(value_parser = ["save", "restore", "list", "delete"])]
@@ -242,8 +244,8 @@ enum VmAction {
     /// all: a Windows service runs in session 0, which has no desktop. See
     /// `supervisor::Qmp::screendump`, and `docs/DECISIONS.md` D-009.
     Capture {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
 
         /// Where to write the PNG. `-` writes to stdout.
         #[arg(long, short)]
@@ -265,8 +267,8 @@ enum VmAction {
     /// session, but a device event is delivered by the kernel to whichever session owns the active
     /// console. See `docs/DECISIONS.md` D-010.
     Input {
-        #[arg(long, default_value = "wvm.toml", global = true)]
-        config: std::path::PathBuf,
+        #[arg(long, global = true)]
+        config: Option<std::path::PathBuf>,
 
         #[command(subcommand)]
         action: InputAction,
@@ -452,6 +454,68 @@ fn main() -> Result<()> {
     }
 }
 
+
+/// Where `wvm` looks for its config, in order, when `--config` is not given.
+///
+/// The order is deliberate and the first three steps preserve today's behaviour exactly, so this
+/// can land without changing anything that already works:
+///
+///   1. `--config <path>` — always wins. A resolver that sometimes overrides an explicit path is
+///      worse than no resolver, because the failure is silent and lands on the wrong VM.
+///   2. `$WVM_CONFIG` — for scripts and CI, where a flag is awkward to thread through.
+///   3. `./wvm.toml` — the current behaviour, kept so nothing that works today breaks.
+///   4. `~/.config/wvm/wvm.toml`, then `~/wvm/wvm.toml` — the conventional locations. This step is
+///      the entire point of the change: it is what removes the friction of typing `--config` from
+///      any directory that is not the VM's.
+///
+/// An *absent* config is an error naming every path tried. The dangerous outcome here is silently
+/// reading a config the user did not mean, so failing loudly is the design, not a fallback.
+fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    let env_config = std::env::var_os("WVM_CONFIG");
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    resolve_config_path_in(
+        explicit,
+        env_config.as_deref(),
+        home.as_deref(),
+        &cwd,
+    )
+}
+
+/// The pure half. Every input is a parameter and nothing is read from the environment, so this can
+/// be tested for which path it picks without racing other tests or depending on where they run.
+fn resolve_config_path_in(
+    explicit: Option<&Path>,
+    env_config: Option<&OsStr>,
+    home: Option<&Path>,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    if let Some(p) = explicit {
+        return Ok(p.to_path_buf());
+    }
+    if let Some(v) = env_config {
+        return Ok(PathBuf::from(v));
+    }
+
+    let mut candidates = vec![cwd.join("wvm.toml")];
+    if let Some(home) = home {
+        candidates.push(home.join(".config/wvm/wvm.toml"));
+        candidates.push(home.join("wvm/wvm.toml"));
+    }
+
+    for c in &candidates {
+        if c.is_file() {
+            return Ok(c.clone());
+        }
+    }
+
+    let tried: Vec<String> = candidates.iter().map(|p| p.display().to_string()).collect();
+    anyhow::bail!(
+        "no VM config found. Looked in: {}.\nPass one with --config <path>, or set $WVM_CONFIG.",
+        tried.join(", ")
+    )
+}
+
 /// VM subcommand dispatch.
 ///
 /// Each action carries its own `config` argument. The duplication is deliberate: a single field
@@ -460,7 +524,7 @@ fn main() -> Result<()> {
 fn run_vm(action: VmAction) -> Result<()> {
     // Pull the config path out first, then act. This keeps the per-action handling below from
     // repeating the load-and-validate preamble.
-    let config_path = match &action {
+    let given = match &action {
         VmAction::Validate { config }
         | VmAction::Cmdline { config }
         | VmAction::Status { config }
@@ -475,6 +539,8 @@ fn run_vm(action: VmAction) -> Result<()> {
         | VmAction::Snapshot { config, .. }
         | VmAction::Input { config, .. } => config.clone(),
     };
+
+    let config_path = resolve_config_path(given.as_deref())?;
 
     // Validate before constructing the supervisor: a bad definition should be reported as a
     // config problem, not as a mysterious launch failure.
@@ -1005,4 +1071,122 @@ fn parse_verb(name: &str) -> Option<Verb> {
         }
     };
     Some(verb)
+}
+// Tests for config discovery.
+//
+// These assert **which path was chosen**, not merely that the call succeeded. That distinction is
+// the whole point: every branch of a search "succeeds" when the right file happens to exist, so a
+// test that only checks for Ok is green even when the precedence is backwards.
+
+#[cfg(test)]
+mod config_discovery_tests {
+    use super::*;
+    use std::fs;
+
+    /// A private directory per test, so they cannot see each other's files.
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("wvm-cfg-{}-{}", std::process::id(), name));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn touch(p: &Path) {
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, "name = \"x\"\n").unwrap();
+    }
+
+    #[test]
+    fn an_explicit_path_wins_over_everything() {
+        // Including over a config that is present and findable. A resolver that can override an
+        // explicit --config is worse than no resolver, because the failure is silent and lands the
+        // operation on a different VM than the one the user named.
+        let d = scratch("explicit");
+        let home = d.join("home");
+        touch(&home.join("wvm/wvm.toml"));
+        touch(&d.join("wvm.toml"));
+
+        let got = resolve_config_path_in(
+            Some(Path::new("/somewhere/mine.toml")),
+            Some(OsStr::new("/somewhere/env.toml")),
+            Some(&home),
+            &d,
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/somewhere/mine.toml"));
+    }
+
+    #[test]
+    fn the_environment_variable_beats_the_search_paths() {
+        let d = scratch("env");
+        let home = d.join("home");
+        touch(&home.join("wvm/wvm.toml"));
+        touch(&d.join("wvm.toml"));
+
+        let got = resolve_config_path_in(None, Some(OsStr::new("/somewhere/env.toml")), Some(&home), &d).unwrap();
+        assert_eq!(got, PathBuf::from("/somewhere/env.toml"));
+    }
+
+    #[test]
+    fn the_current_directory_still_beats_the_per_user_locations() {
+        // Backwards compatibility, and the reason ./wvm.toml stays ahead of the home search: any
+        // existing workflow that runs from the VM's directory must keep resolving the same file.
+        let d = scratch("cwd");
+        let home = d.join("home");
+        touch(&d.join("wvm.toml"));
+        touch(&home.join("wvm/wvm.toml"));
+        touch(&home.join(".config/wvm/wvm.toml"));
+
+        let got = resolve_config_path_in(None, None, Some(&home), &d).unwrap();
+        assert_eq!(got, d.join("wvm.toml"));
+    }
+
+    #[test]
+    fn a_per_user_config_is_found_without_any_flag() {
+        // The friction this change exists to remove: `wvm vm display show` from an unrelated
+        // directory. Before this, it was `Error: reading VM config wvm.toml`.
+        let d = scratch("home-config");
+        let home = d.join("home");
+        touch(&home.join(".config/wvm/wvm.toml"));
+
+        let got = resolve_config_path_in(None, None, Some(&home), &d).unwrap();
+        assert_eq!(got, home.join(".config/wvm/wvm.toml"));
+    }
+
+    #[test]
+    fn the_home_directory_location_is_the_second_choice() {
+        let d = scratch("home-wvm");
+        let home = d.join("home");
+        touch(&home.join("wvm/wvm.toml"));
+
+        let got = resolve_config_path_in(None, None, Some(&home), &d).unwrap();
+        assert_eq!(got, home.join("wvm/wvm.toml"));
+    }
+
+    #[test]
+    fn when_nothing_exists_the_error_names_every_path_it_tried() {
+        // The dangerous failure here is not "not found", it is silently reading a config the user
+        // did not mean. So the miss must be loud and must say where it looked and what to do.
+        let d = scratch("missing");
+        let home = d.join("nothing-here");
+
+        let err = resolve_config_path_in(None, None, Some(&home), &d)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("wvm.toml"), "names no file: {err}");
+        assert!(err.contains(".config/wvm"), "does not name the per-user path: {err}");
+        assert!(err.contains("--config"), "does not say how to fix it: {err}");
+    }
+
+    #[test]
+    fn with_no_home_the_current_directory_is_still_searched() {
+        // HOME can legitimately be unset (cron, containers). That must not turn into a panic or an
+        // empty search -- it should degrade to the behaviour that worked before.
+        let d = scratch("no-home");
+        touch(&d.join("wvm.toml"));
+
+        let got = resolve_config_path_in(None, None, None, &d).unwrap();
+        assert_eq!(got, d.join("wvm.toml"));
+    }
 }

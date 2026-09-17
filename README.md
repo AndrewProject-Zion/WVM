@@ -305,6 +305,10 @@ cargo build --release
 sudo install -m 0755 target/release/wvm /usr/local/bin/wvm   # or ~/.local/bin/wvm, no sudo
 ```
 
+`--config` is optional when the config is somewhere it can find: `./wvm.toml` in the current
+directory, `$WVM_CONFIG`, `~/.config/wvm/wvm.toml`, or `~/wvm/wvm.toml`. The examples below
+pass it explicitly anyway, because that is unambiguous when more than one VM exists.
+
 If you are working on the host only, you can skip the Windows install further down and point the
 config at an existing guest image.
 
