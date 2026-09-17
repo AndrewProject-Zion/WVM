@@ -1086,3 +1086,44 @@ perfectly — the guest was innocent, and so was WVM.
 with a fully working network. Before blaming the VM, check whether the *guest itself* can fetch the
 NCSI URL — that is a two-command test, and it separates "the network is broken" from "Windows has
 been told the network is broken" (`scripts/guest-ncsi-status.ps1`).
+
+## D-021 — The display server is always-on, because an ignored one costs nothing
+
+**Date:** 2026-09-17
+**Status:** decided, and measured rather than assumed
+
+The plan had two shapes: an always-on SPICE server (simple, viewer attaches instantly) or
+`-display dbus` + `display-reload` (genuinely zero cost until asked, but viewer support unproven).
+The choice turned on one number, so it was measured before any code was written.
+
+**The first attempt was the wrong instrument.** Measuring the live Windows guest gave QEMU 136% of
+one core -- the guest does its own background work on its own schedule, so any A/B there measures
+Windows, not the display server. "Lost in the noise" is not an answer to a design question.
+
+**Then the first version of the corrected probe reported 0.00% for every arm, including one with a
+viewer attached.** Three zeros look like a perfect finding whether the probe works or not, so that
+reading was treated as a broken instrument rather than a result. Fixed by adding what was missing:
+
+    D  POSITIVE CONTROL: vCPU running     13 ticks    0.433% of one core
+    A  no display server                   0 ticks    0.000%
+    B  spice, nobody watching              0 ticks    0.000%
+
+    an ignored SPICE server costs +0.000% of one core
+
+The control arm runs the same QEMU with the vCPU RUNNING, which must consume CPU. When it does, the
+zeros on A and B mean something. The probe now refuses to print numbers at all if the control reads
+zero, and says so instead ("INSTRUMENT FAILED") -- a measurement that cannot fail is not one.
+
+**Decision: Option A.** An always-on SPICE server bound to a unix socket costs nothing measurable
+while nobody is attached, so the complexity of the dbus path buys nothing. Recorded here because the
+number is the whole justification, and because the next person to consider "always-on is wasteful"
+should find this measurement rather than repeat the reasoning.
+
+**Not measured, and stated so it is not overread:** the arms halt the vCPU, so this is an IDLE cost,
+not a per-frame one. It would not catch a design that burns CPU pushing updates to a connected
+client. Arm C (viewer attached) exists behind `--with-viewer` for that.
+
+**Incidental finding worth more than the number:** `scripts/start-windows.sh` defaults to
+`--display gtk`, so the standard way to start this VM opens a GTK window that lives INSIDE the QEMU
+process and therefore cannot be closed without killing the VM. Only `--headless` avoids it. That
+reframes the feature: it is not "give the VM a window", it is "make the window closable".

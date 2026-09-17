@@ -71,6 +71,7 @@ impl ServerConfig {
                     Verb::Input,
                     Verb::Transfer,
                     Verb::Lifecycle,
+                    Verb::Display,
                 ],
                 read_roots: vec![scratch.join("in").display().to_string()],
                 write_roots: vec![scratch.join("out").display().to_string()],
@@ -336,6 +337,10 @@ impl Server {
             Request::TransferChunk { .. } => no_guest("transfer chunk"),
             Request::PullChunk { .. } => no_guest("pull chunk"),
             Request::Lifecycle { .. } => no_guest("lifecycle"),
+            // Display is driven host-side over QMP, exactly as lifecycle is. The daemon has no
+            // viewer to offer, so it answers the same way -- and the guest, which is the more
+            // useful place for the explanation to live, refuses it with the command that works.
+            Request::Display { .. } => no_guest("display"),
         }
     }
 }
@@ -366,6 +371,7 @@ fn op_name(request: &Request) -> &'static str {
         Request::PullChunk { .. } => "pull_chunk",
         Request::Transfer { .. } => "transfer",
         Request::Lifecycle { .. } => "lifecycle",
+        Request::Display { .. } => "display",
     }
 }
 

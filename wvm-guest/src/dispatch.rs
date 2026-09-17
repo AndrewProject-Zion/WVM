@@ -396,6 +396,18 @@ pub fn handle(request: &Request) -> Response {
                  rather than by a connection timing out"
             ),
         },
+
+        // Host-only, like lifecycle, and permanent for the same reason: the guest has no view of
+        // the hypervisor that renders its framebuffer, so there is no implementation to be written
+        // later. The refusal names the command that works rather than leaving the caller to guess.
+        Request::Display { action } => Response::Error {
+            message: format!(
+                "display/{action}: the guest cannot see or reach its own hypervisor, so putting the \
+                 desktop on screen is a HOST operation. Use `wvm vm display show|hide|status` on \
+                 the host. This verb answers here so the boundary is discoverable by asking, \
+                 rather than by a connection timing out"
+            ),
+        },
     }
 }
 
@@ -439,7 +451,7 @@ pub fn validate(request: &Request) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wvm_ipc::{InputEvent, LifecycleAction, TransferDirection};
+    use wvm_ipc::{DisplayAction, InputEvent, LifecycleAction, TransferDirection};
 
     #[test]
     fn handshake_with_matching_version_is_ready() {
@@ -619,6 +631,39 @@ mod tests {
                     );
                 }
                 other => panic!("lifecycle must refuse from the guest; got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn display_is_refused_as_host_only_for_the_same_reason_as_lifecycle() {
+        // The same distinction, and the same cost if it is got wrong: a caller reading "not
+        // implemented" waits for an upgrade that will never come, because no future version of this
+        // service gives the guest a view of the hypervisor that owns its framebuffer.
+        //
+        // Every action is checked, not just one -- `status` in particular must refuse too, since a
+        // caller polling it would otherwise learn nothing about why there is no answer.
+        for action in [
+            DisplayAction::Show,
+            DisplayAction::Hide,
+            DisplayAction::Status,
+        ] {
+            match handle(&Request::Display { action }) {
+                Response::Error { message } => {
+                    assert!(
+                        !message.contains("not implemented"),
+                        "display must not read as merely unwritten: {message}"
+                    );
+                    assert!(
+                        message.contains("HOST"),
+                        "the refusal must say WHERE the operation lives, or it is a dead end: {message}"
+                    );
+                    assert!(
+                        message.contains("wvm vm display"),
+                        "the refusal must name the command that does work: {message}"
+                    );
+                }
+                other => panic!("display must refuse from the guest; got {other:?}"),
             }
         }
     }

@@ -45,6 +45,8 @@ pub enum Verb {
     Transfer,
     /// Change VM lifecycle: start, suspend, snapshot, restore.
     Lifecycle,
+    /// Put the VM's desktop on screen on demand, and take it away again.
+    Display,
 }
 
 impl Verb {
@@ -57,6 +59,7 @@ impl Verb {
             Verb::Input => "input",
             Verb::Transfer => "transfer",
             Verb::Lifecycle => "lifecycle",
+            Verb::Display => "display",
         }
     }
 }
@@ -217,6 +220,9 @@ pub enum Request {
 
     /// VM lifecycle. Exercises [`Verb::Lifecycle`].
     Lifecycle { action: LifecycleAction },
+
+    /// Put the desktop on screen, or take it away. Exercises [`Verb::Display`].
+    Display { action: DisplayAction },
 }
 
 /// Input events, expressed as protocol data rather than synthetic X11/Windows messages so the
@@ -276,6 +282,32 @@ pub enum LifecycleAction {
     Shutdown,
 }
 
+/// What to do with the VM's display. Host-side only: the guest cannot see its own hypervisor, so
+/// the guest answers this with a refusal that names the command that works (see dispatch.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayAction {
+    /// Attach a viewer window to the running VM.
+    Show,
+    /// Detach the viewer, returning to pure headless operation.
+    Hide,
+    /// Report whether a viewer is attached. Never an error when one is not: "nobody is watching" is
+    /// the normal state and the one this verb is called in most.
+    Status,
+}
+
+impl std::fmt::Display for DisplayAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The wire spelling, matching the serde rename, so a refusal and the request that caused it
+        // use the same word.
+        match self {
+            DisplayAction::Show => write!(f, "show"),
+            DisplayAction::Hide => write!(f, "hide"),
+            DisplayAction::Status => write!(f, "status"),
+        }
+    }
+}
+
 impl std::fmt::Display for LifecycleAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The wire spelling, matching the serde rename, so an error message and the request that
@@ -319,6 +351,7 @@ impl Request {
             | Request::TransferChunk { .. }
             | Request::PullChunk { .. } => Verb::Transfer,
             Request::Lifecycle { .. } => Verb::Lifecycle,
+            Request::Display { .. } => Verb::Display,
         }
     }
 }
@@ -355,6 +388,9 @@ pub enum RequestKind {
     Lifecycle {
         action: LifecycleAction,
     },
+    Display {
+        action: DisplayAction,
+    },
 }
 
 impl RequestKind {
@@ -366,6 +402,7 @@ impl RequestKind {
             RequestKind::Input { .. } => Verb::Input,
             RequestKind::Transfer { .. } => Verb::Transfer,
             RequestKind::Lifecycle { .. } => Verb::Lifecycle,
+            RequestKind::Display { .. } => Verb::Display,
         }
     }
 
@@ -403,6 +440,7 @@ impl RequestKind {
                 overwrite,
             },
             RequestKind::Lifecycle { action } => Request::Lifecycle { action },
+            RequestKind::Display { action } => Request::Display { action },
         }
     }
 }
@@ -671,6 +709,7 @@ mod tests {
                 Verb::Input,
                 Verb::Transfer,
                 Verb::Lifecycle,
+                Verb::Display,
             ],
             read_roots: vec!["/srv/wvm/in".into()],
             write_roots: vec!["/srv/wvm/out".into()],
@@ -744,12 +783,57 @@ mod tests {
             RequestKind::Lifecycle {
                 action: LifecycleAction::Suspend,
             },
+            RequestKind::Display {
+                action: DisplayAction::Show,
+            },
         ];
+        // THIS LIST IS MAINTAINED BY HAND, so it is only as good as the person editing it. The
+        // canary below deliberately encodes the number of Verb variants: adding a verb without
+        // adding a kind here turns this test red, which is the only reason a missing entry gets
+        // noticed. It has already been the case once that a variant was added and this list was
+        // not, and the test passed while covering nothing.
+        assert_eq!(
+            kinds.len(),
+            7,
+            "one kind per Verb variant (inspect, exec, capture, input, transfer, lifecycle, \
+display) — if you added a verb, add its kind to this list and bump this number"
+        );
         for k in kinds {
             let verb = k.required_verb();
             let r = Request::new(&g, k).expect("granted");
             assert_eq!(r.required_verb(), verb);
         }
+    }
+
+    #[test]
+    fn a_display_request_says_what_it_is_on_the_wire() {
+        // Both halves matter and neither is visible from the type alone:
+        //  - the wire spelling is what a caller types and what a refusal quotes back, so "show"
+        //    has to survive serialisation unchanged;
+        //  - the verb mapping is what the capability gate authorises against, so a Display request
+        //    that mapped to, say, Lifecycle would be granted by the wrong grant.
+        assert_eq!(DisplayAction::Show.to_string(), "show");
+        assert_eq!(DisplayAction::Hide.to_string(), "hide");
+        assert_eq!(DisplayAction::Status.to_string(), "status");
+
+        let kind = RequestKind::Display {
+            action: DisplayAction::Show,
+        };
+        assert_eq!(kind.required_verb(), Verb::Display);
+
+        let encoded = serde_json::to_string(&kind.into_request()).unwrap();
+        assert!(
+            encoded.contains("\"action\":\"show\""),
+            "wire spelling drifted: {encoded}"
+        );
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.required_verb(), Verb::Display);
+        assert!(matches!(
+            decoded,
+            Request::Display {
+                action: DisplayAction::Show
+            }
+        ));
     }
 
     #[test]
