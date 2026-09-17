@@ -122,6 +122,13 @@ BIN="target/release/wvm"
 if [ ! -x "$BIN" ]; then
     printf '  %-24s NOT BUILT — cannot check (run cargo build --release first)\n' "WVM.md"
     fail=1
+# A STALE binary makes this whole section a false green, and it happened while adding the display
+# verb: the docs were regenerated from a binary built BEFORE the capability was added, so the
+# comparison was stale-against-stale and passed while the verb was missing from both. Two sides
+# wrong together are indistinguishable from two sides right.
+elif [ -n "$(find wvm-host/src wvm-ipc/src wvm-guest/src -name '*.rs' -newer "$BIN" 2>/dev/null | head -1)" ]; then
+    printf '  %-24s STALE BINARY — source is newer; run cargo build --release first\n' "WVM.md"
+    fail=1
 else
     if "$BIN" capabilities --markdown | diff -q - WVM.md >/dev/null 2>&1; then
         printf '  %-24s up to date (%s verbs)\n' "WVM.md" "$("$BIN" capabilities --json | grep -c '"op"')"

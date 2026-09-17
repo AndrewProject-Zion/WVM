@@ -19,9 +19,29 @@ WinPodX, winapps, LinOffice all put individual Windows windows on a Linux deskto
 RemoteApp. WVM exists for the case they do not cover: **an agent or a program driving a Windows
 guest over a typed protocol, headless, with an auditable capability boundary.**
 
+The same guest is both things at once. Give it to an agent as a sandbox, and the desktop is still
+there when a human wants it:
+
+```
+wvm vm display show     # a window onto the running guest, for you
+wvm vm display hide     # gone again; the VM never notices
+wvm vm exec "..."       # and the agent carries on driving the same machine
+```
+
+**That combination is structural, not a feature.** WinBoat and WinPodX are built around *per-app
+windows* — their architecture needs the machine display-connected to be useful at all. WVM is built
+around a protocol on a socket, so the desktop is genuinely optional: it can arrive or leave at any
+moment without the agent seeing anything change. **The window is a view, not the interface.**
+Closing it does not stop the VM, because the viewer is a separate process — see the `display` traps
+in [`WVM.md`](WVM.md).
+
 **Status: every verb implemented and verified against a live guest** — `exec`, `capture`, `input`,
-`transfer push`, `transfer pull`, and snapshots (save, restore, list, delete). Nothing in the
-protocol is a stub.
+`transfer push`, `transfer pull`, `display`, and snapshots (save, restore, list, delete). Nothing in
+the protocol is a stub.
+
+The guest also has **working audio**: a sound card it drives with Windows' own in-box driver, routed
+to the viewer so it comes out of the viewer's speakers rather than this machine's. Confirmed by ear,
+not only by measurement.
 
 > **Snapshots carry a known risk.** On this Windows 11 build a `snapshot save` has bugchecked the
 > guest with `0x50 PAGE_FAULT_IN_NONPAGED_AREA` — four times, with identical parameters, faulting at

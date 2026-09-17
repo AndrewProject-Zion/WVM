@@ -109,6 +109,22 @@ Traps:
 - A snapshot holds the machine's MEMORY as well as its disk, so it is roughly the RAM size rather than a delta. That is what makes a restore a rollback instead of a disk revert — and why snapshots are worth deleting.
 - Restoring while the guest is running is supported and it survives. It is still a rollback: anything written since the snapshot is gone, including files the agent created.
 
+### `display`
+
+Put the running guest's desktop on screen on request, and take it away again. Carries the guest's audio to the same viewer.
+
+- **Runs on:** host
+- **CLI:** `wvm vm display show|hide|status --config <cfg>`
+
+Traps:
+
+- THE WINDOW IS NOT THE VM. A viewer is a separate process attached to a socket, so closing it does NOT stop the guest — verified by hiding the display and watching the QEMU pid stay up with the guest still answering. This is the difference from a GTK display, which lives inside QEMU and can only be closed by killing the machine. An agent may show and hide the desktop as often as it likes without interrupting its own work.
+- The display server is ALWAYS there; only viewers come and go. An ignored server was measured at 0 CPU ticks over 30 seconds against a positive control, so there is no cost to leaving it attached and no reason to make it conditional.
+- `show` REFUSES if a viewer is already attached. A second simultaneous SPICE attachment is the unreliable path — measured taking the count 1 -> 2 with one of them then exiting, which is the reported symptom 'connected to server but never makes it'. Close the first window before opening another.
+- The socket is a UNIX socket and is deliberately UNAUTHENTICATED (`disable-ticketing=on`), so its location IS its access control. QEMU creates it mode 775 regardless of the umask, so the 0700 parent directory is the only thing guarding it — never move this to a TCP port or a shared directory.
+- The guest REFUSES this verb, permanently, and says where the operation actually lives. The guest cannot see or reach its own hypervisor, so it has no view of the framebuffer that renders it.
+- Audio needs an explicit `-audiodev`, and the audio arguments must be gated on the SAME condition as the display server: an hda device with no `-audiodev` refuses to start ('no default audio driver available') and `-audiodev spice` with no `-spice` refuses too. Both are a VM that will not boot, not merely a silent one.
+
 ## What the guest will refuse, and why that is the answer
 
 `lifecycle` is refused from inside the guest, permanently. Snapshots are a hypervisor
