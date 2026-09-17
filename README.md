@@ -297,13 +297,19 @@ one — so they are wired together rather than left to whoever remembers to run 
 This walks from a bare Linux host to driving a Windows guest. It takes about an hour, most of it
 the Windows install.
 
-Every command below is written as bare `wvm`. Build it and put it on your PATH once, or you will
-hit `Command 'wvm' not found` on the very first line:
+Every command below is written as bare `wvm`, so install it once. One script checks the
+prerequisites, builds it, puts it on your PATH, and **proves the installed copy runs from outside
+this repository** -- because a binary that works only from the directory it was built in is the
+mistake that step exists to catch:
 
 ```sh
-cargo build --release
-sudo install -m 0755 target/release/wvm /usr/local/bin/wvm   # or ~/.local/bin/wvm, no sudo
+scripts/install.sh            # checks, builds, installs, verifies
+scripts/install.sh --check    # report only; changes nothing
+scripts/install.sh --link     # symlink instead of copy, so rebuilds are picked up
 ```
+
+It reports `ok` / `MISSING` / `COULD NOT RUN` and treats the third as a failure, the same three
+states `scripts/verify-all.sh` uses. If a prerequisite is absent it says so and changes nothing.
 
 `--config` is optional when the config is somewhere it can find: `./wvm.toml` in the current
 directory, `$WVM_CONFIG`, `~/.config/wvm/wvm.toml`, or `~/wvm/wvm.toml`. The examples below
