@@ -1029,3 +1029,60 @@ production binary in D-014, and it does not get to happen again.
 Measured: the base is still 76189 MiB after a full session of experiments against it — including
 five snapshot save/restore cycles and four forced TRIMs — because every write went to the overlay.
 That is the property worth having: **a bad experiment now costs one `rm`, not a Windows reinstall.**
+
+## D-020 — "No internet" in the guest was a DNS filter, not the VM
+
+**Date:** 2026-09-17
+**Status:** resolved
+
+**Symptom.** The Windows guest showed no internet connection in its own UI. Every layer that can be
+measured from outside was healthy:
+
+    DHCP    10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3      fine
+    ICMP    ping 10.0.2.2                                  fine
+    DNS     nslookup github.com -> 20.26.156.215           fine
+    HTTPS   curl https://example.com -> HTTP/1.1 200 OK    fine
+
+**Cause.** Windows decides whether to show the connected/disconnected globe using NCSI, which fetches
+`www.msftconnecttest.com/connecttest.txt` and expects the literal string `Microsoft Connect Test`.
+That single hostname failed to resolve *inside the guest* while `ipv6.msftconnecttest.com` worked:
+
+    www.msftconnecttest.com   -> curl: (6) Could not resolve host
+    ipv6.msftconnecttest.com  -> Microsoft Connect Test
+
+The host's resolver is Pi-hole, and the guest's DNS reaches it through slirp. Pi-hole v6.4.2 was
+denying the name:
+
+    blocking rule:  ||www.msftconnecttest.com^
+    from list:      TimTheBig/tv_block_list_for_pi-hole (TV_block_pi-hole.txt)
+
+A **smart-TV telemetry blocklist** contains the same hostname Windows uses for its connectivity
+check. So every Windows machine resolving through this Pi-hole reports "No internet" while working
+perfectly — the guest was innocent, and so was WVM.
+
+**Fix.** Allow the exact FQDN in Pi-hole:
+
+    podman exec pihole pihole allow www.msftconnecttest.com
+
+**Two traps, both measured:**
+
+1. **Allowing the parent domain is not enough.** `pihole allow msftconnecttest.com` was accepted and
+   changed nothing, because the blocklist entry is a *regex* (`||domain^`) and the exact allow for
+   the parent does not override it. The exact FQDN does. Adding a rule and seeing it reported as
+   added is not the same as the rule taking effect — resolution was re-checked before and after.
+2. **NCSI caches, and restarting NlaSvc does not clear it.** After DNS was fixed, Windows still said
+   `LocalAccess`. `Restart-Service nlasvc` left it at `LocalAccess`; only a network-change event
+   moved it, and the reliable one is bouncing the adapter:
+
+       start : LocalAccess
+       after1: LocalAccess        <- NlaSvc restart
+       after2: InternetAccess     <- adapter bounce
+
+   Because bouncing the adapter drops the control channel, the check writes its result to a FILE
+   (`C:\ProgramData\wvm\staging\ncsi-after.txt`) rather than returning it — a reply that is lost with
+   its connection is indistinguishable from a hang.
+
+**Consequence for anyone running this.** A guest behind a filtered resolver can show "no internet"
+with a fully working network. Before blaming the VM, check whether the *guest itself* can fetch the
+NCSI URL — that is a two-command test, and it separates "the network is broken" from "Windows has
+been told the network is broken" (`scripts/guest-ncsi-status.ps1`).

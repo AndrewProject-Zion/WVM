@@ -150,6 +150,13 @@ one — so they are wired together rather than left to whoever remembers to run 
 
 ## Known gaps, recorded rather than hidden
 
+- **A filtered resolver can make the guest say "no internet" while the network is fine.** Windows
+  decides on the globe icon by fetching `www.msftconnecttest.com/connecttest.txt` and expecting
+  `Microsoft Connect Test`. If the host's DNS filter denies that hostname — a smart-TV telemetry
+  blocklist does, via `||www.msftconnecttest.com^` — the guest reports no connection while DHCP, DNS,
+  ICMP and HTTPS all work. Test the guest's own fetch of that URL before suspecting the VM
+  (`scripts/guest-ncsi-status.ps1`). Allowing the *parent* domain does not override a regex block;
+  the exact FQDN does, and NCSI then needs a network-change event to notice. See D-020.
 - **A request that ignores its deadline no longer holds the channel.** Requests run under a fifteen
   minute backstop and connections are served on their own threads, so a wedged request is abandoned
   and the listener stays reachable (D-015). What is still true: **the abandoned work is not
