@@ -678,9 +678,9 @@ fn run_vm(action: VmAction) -> Result<()> {
             let config = supervisor.config();
             match action.as_str() {
                 "show" => {
-                    let pid = display::show(&config)?;
+                    let pid = display::show(config)?;
                     println!("  viewer started (pid {pid})");
-                    println!("  {}", display::describe(&config));
+                    println!("  {}", display::describe(config));
                     println!();
                     println!("  Close that window whenever you like. It is a separate process, so");
                     println!(
@@ -692,14 +692,14 @@ fn run_vm(action: VmAction) -> Result<()> {
                     Ok(())
                 }
                 "hide" => {
-                    match display::hide(&config)? {
+                    match display::hide(config)? {
                         0 => println!("  no viewer attached; nothing to close"),
                         n => println!("  closed {n} viewer(s). The VM is untouched."),
                     }
                     Ok(())
                 }
                 "status" => {
-                    println!("  {}", display::describe(&config));
+                    println!("  {}", display::describe(config));
                     Ok(())
                 }
                 other => anyhow::bail!("unknown display action '{other}'"),
