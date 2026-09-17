@@ -24,6 +24,7 @@ Usage:  python3 scripts/test-timeout-tree-kill.py [--port 48274]
 import argparse
 import json
 import socket
+import subprocess
 import struct
 import sys
 import time
@@ -87,6 +88,7 @@ def count_stubborn(port):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default=str(__import__("pathlib").Path.home() / "wvm/wvm.toml"), help="VM config")
     ap.add_argument("--port", type=int, default=48274)
     ap.add_argument("--script", default=r"C:\ProgramData\wvm\staging\stubborn.cmd")
     args = ap.parse_args()
@@ -99,21 +101,34 @@ def main():
         print("channel is not up")
         return 2
 
-    # --- fetch the script into the guest ---
+    # --- put the script into the guest ---
+    #
+    # Via the transfer verb, NOT by having the guest curl a host HTTP server.
+    #
+    # The HTTP version made this probe depend on a server somebody had started by hand on
+    # 10.0.2.2:8899. When the host rebooted and that server was gone, the guest's curl exited 7 and
+    # the probe reported a BUILD FAILURE — for a missing convenience server. That is the same
+    # three-state confusion the runner exists to prevent: "the environment is not here" is not "the
+    # build is broken", and reporting it as one sends the reader hunting a regression that does not
+    # exist. It also cannot be fixed by re-running, which makes a red result useless.
+    #
+    # transfer push is our own verified path (D-012) and needs nothing but the guest being up.
+    # --overwrite because the destination legitimately already holds this script from a prior run:
+    # without it the push is refused and this probe could only ever pass once.
     print()
-    print("FETCH the stubborn-tree script")
-    r = call(args.port, {
-        "op": "exec",
-        "program": "cmd.exe",
-        "args": ["/c", f"curl -sS -o {args.script} http://10.0.2.2:8899/guest-stubborn-tree.cmd"],
-        "cwd": None,
-        "require_allowlist": False,
-        "timeout_ms": 30000,
-    })
-    res = r.get("payload", {}) if r else {}
-    print(f"  {res.get('outcome')} code={res.get('code')}")
-    if res.get("code") != 0:
-        failures.append("could not fetch the test script")
+    print("PUT the stubborn-tree script into the guest")
+    pushed = subprocess.run(
+        ["./target/release/wvm", "vm", "transfer", "push", "--overwrite", "--config", args.config,
+         "./scripts/guest-stubborn-tree.cmd", args.script],
+        capture_output=True, text=True, cwd=".", timeout=120,
+    )
+    tail = (pushed.stdout + pushed.stderr).strip().splitlines()
+    print(f"  exit={pushed.returncode} {tail[-1][:90] if tail else ''}")
+    if pushed.returncode != 0:
+        # The channel answered hello a moment ago, so a push failure here is environmental
+        # (the binary is missing, the guest went away) rather than this build being wrong.
+        print("  could not place the test script — cannot run this probe")
+        return 2
 
     # --- CONTROL: run it with a LONG timeout so it spawns and is observable ---
     #
