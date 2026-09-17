@@ -12,6 +12,7 @@
 //! not already granted.
 
 mod capabilities;
+mod display;
 mod doctor;
 mod guestclient;
 mod image;
@@ -209,6 +210,20 @@ enum VmAction {
     ///
     /// Requires the VM to be running — QEMU holds the state, so this is a QMP operation against a
     /// live hypervisor.
+    /// Put the guest's desktop on screen, on request: `show`, `hide` or `status`.
+    ///
+    /// Separate from `start` on purpose. The display server always exists (D-021), so this only
+    /// attaches or detaches a VIEWER -- a separate process, which means closing the window cannot
+    /// take the VM down with it.
+    Display {
+        #[arg(long, default_value = "wvm.toml", global = true)]
+        config: std::path::PathBuf,
+
+        /// `show`, `hide` or `status`.
+        #[arg(value_parser = ["show", "hide", "status"])]
+        action: String,
+    },
+
     Snapshot {
         #[arg(long, default_value = "wvm.toml", global = true)]
         config: std::path::PathBuf,
@@ -456,6 +471,7 @@ fn run_vm(action: VmAction) -> Result<()> {
         | VmAction::Log { config, .. }
         | VmAction::Transfer { config, .. }
         | VmAction::Capture { config, .. }
+        | VmAction::Display { config, .. }
         | VmAction::Snapshot { config, .. }
         | VmAction::Input { config, .. } => config.clone(),
     };
@@ -655,6 +671,38 @@ fn run_vm(action: VmAction) -> Result<()> {
                     Ok(())
                 }
                 other => anyhow::bail!("unknown transfer action '{other}' (expected push or pull)"),
+            }
+        }
+
+        VmAction::Display { action, .. } => {
+            let config = supervisor.config();
+            match action.as_str() {
+                "show" => {
+                    let pid = display::show(&config)?;
+                    println!("  viewer started (pid {pid})");
+                    println!("  {}", display::describe(&config));
+                    println!();
+                    println!("  Close that window whenever you like. It is a separate process, so");
+                    println!(
+                        "  closing it does NOT stop the VM -- which is the difference between"
+                    );
+                    println!(
+                        "  this and the GTK display scripts/start-windows.sh uses by default."
+                    );
+                    Ok(())
+                }
+                "hide" => {
+                    match display::hide(&config)? {
+                        0 => println!("  no viewer attached; nothing to close"),
+                        n => println!("  closed {n} viewer(s). The VM is untouched."),
+                    }
+                    Ok(())
+                }
+                "status" => {
+                    println!("  {}", display::describe(&config));
+                    Ok(())
+                }
+                other => anyhow::bail!("unknown display action '{other}'"),
             }
         }
 

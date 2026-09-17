@@ -19,3 +19,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+# SIGTERM to a viewer we started. Deliberately the only unsafe call in this crate, and it is
+# a signal to a process we identified by its own argv -- not a shell-out to `pkill -f`, whose
+# pattern also matches the shell running the search.
+libc = "0.2"

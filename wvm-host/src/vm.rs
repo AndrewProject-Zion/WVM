@@ -773,8 +773,14 @@ mod tests {
         // only safe because the display server above it is unconditional. Make one conditional and
         // this fails, which is the point.
         let joined = config().qemu_args().join(" ");
-        assert!(joined.contains("-audiodev spice"), "no audio backend: {joined}");
-        assert!(joined.contains("ich9-intel-hda"), "no audio controller: {joined}");
+        assert!(
+            joined.contains("-audiodev spice"),
+            "no audio backend: {joined}"
+        );
+        assert!(
+            joined.contains("ich9-intel-hda"),
+            "no audio controller: {joined}"
+        );
         assert!(joined.contains("hda-output"), "no codec: {joined}");
         assert_eq!(
             joined.contains("-spice"),
@@ -783,10 +789,19 @@ mod tests {
         );
         // pipewire/pa were measured to open a sink on the HOST, so the guest's audio would come out
         // of this machine's speakers instead of the viewer.
-        assert!(!joined.contains("-audiodev pipewire"), "audio would leave the viewer: {joined}");
-        assert!(!joined.contains("-audiodev pa,"), "audio would leave the viewer: {joined}");
+        assert!(
+            !joined.contains("-audiodev pipewire"),
+            "audio would leave the viewer: {joined}"
+        );
+        assert!(
+            !joined.contains("-audiodev pa,"),
+            "audio would leave the viewer: {joined}"
+        );
         // Output-only on purpose: duplex would give an agent-driven guest a route to the host's mic.
-        assert!(!joined.contains("hda-duplex"), "duplex adds a capture path: {joined}");
+        assert!(
+            !joined.contains("hda-duplex"),
+            "duplex adds a capture path: {joined}"
+        );
     }
 
     #[test]
@@ -798,13 +813,22 @@ mod tests {
         // interface with nothing in front of it. So what is checked is the SHAPE of the argument,
         // not merely that "-spice" appears somewhere in the command line.
         let joined = config().qemu_args().join(" ");
-        assert!(joined.contains("-spice"), "no display server at all: {joined}");
-        assert!(joined.contains("unix=on"), "must bind a unix socket: {joined}");
+        assert!(
+            joined.contains("-spice"),
+            "no display server at all: {joined}"
+        );
+        assert!(
+            joined.contains("unix=on"),
+            "must bind a unix socket: {joined}"
+        );
         assert!(
             joined.contains("wvm/w11.spice.sock"),
             "the socket must live in the per-user runtime tree: {joined}"
         );
-        assert!(!joined.contains("port="), "must not bind a TCP port: {joined}");
+        assert!(
+            !joined.contains("port="),
+            "must not bind a TCP port: {joined}"
+        );
         assert!(
             !joined.contains("addr=0.0.0.0"),
             "must not bind all interfaces: {joined}"
@@ -812,7 +836,10 @@ mod tests {
         // Headless has to survive alongside it: the server is added TO `-display none`, not
         // instead of it. Losing that would make the VM need a desktop session to start at all --
         // which is the thing D-004 exists to prevent.
-        assert!(joined.contains("-display none"), "headless was lost: {joined}");
+        assert!(
+            joined.contains("-display none"),
+            "headless was lost: {joined}"
+        );
     }
 
     #[test]
